@@ -25,8 +25,12 @@ const STUCK_DURATION = 10; // Frames to stay stuck before intelligent escape (re
 const WIGGLE_STRENGTH = 0.3; // Strength of wiggling movement
 const ESCAPE_BURST_VELOCITY = 3.0; // High velocity burst for intelligent escape
 const ESCAPE_BURST_DURATION = 15; // Frames to maintain escape burst
-const OBSTACLE_AVOIDANCE_DISTANCE = 150; // Distance to start avoiding obstacle
-const OBSTACLE_AVOIDANCE_STRENGTH = 0.5; // Strength of avoidance force
+const OBSTACLE_AVOIDANCE_DISTANCE = 250; // Distance to start detecting and avoiding obstacle
+const OBSTACLE_DECELERATION_DISTANCE = 200; // Distance to start decelerating
+const OBSTACLE_AVOIDANCE_STRENGTH = 0.8; // Strength of avoidance force
+const DECELERATION_FACTOR = 0.85; // How much to reduce velocity when approaching obstacle
+const ACCELERATION_FACTOR = 1.15; // How much to increase velocity after avoiding (capped at BASE_VELOCITY)
+const MIN_APPROACH_VELOCITY = BASE_VELOCITY * 0.4; // Minimum velocity when approaching obstacle
 const STUCK_POSITION_THRESHOLD = 5; // Max position change to consider "stuck in place"
 const RANDOM_FACTOR = 0.05;
 const TARGET_SMOOTHING = 0.05;
@@ -126,15 +130,21 @@ const App = () => {
     const obstacleOrbitAngleRef = useRef(0);
     const [racers, setRacers] = useState([]);
     const [finishedRankings, setFinishedRankings] = useState([]);
-    const [bet, setBet] = useState(null);
-    const [difficulty, setDifficulty] = useState(4);
-    const [statusText, setStatusText] = useState("");
-    const velocityChangeTimersRef = useRef([]);
+            const [bet, setBet] = useState(null);
+            const [difficulty, setDifficulty] = useState(4);
+            const [statusText, setStatusText] = useState("");
+            const [consecutiveWins, setConsecutiveWins] = useState(0);
+            const [countdown, setCountdown] = useState(null);
+            const [goalReached, setGoalReached] = useState(false);
+            const velocityChangeTimersRef = useRef([]);
+            const takoImageRef = useRef(null);
 
     const initializeRace = useCallback((width, height) => {
         setDust(generateDust(width, height));
         setFinishedRankings([]);
         setStatusText("");
+        setGoalReached(false);
+        setCountdown(3);
 
         // Generate single giant obstacle in center with flowing movement
         const centerX = width * 0.5;
@@ -166,17 +176,43 @@ const App = () => {
         velocityChangeTimersRef.current.forEach(timer => clearTimeout(timer));
         velocityChangeTimersRef.current = [];
 
-        return HORSES_CONFIG.map((config) => {
-            const startX = Math.random() * (width * 0.10);
-            const startY = (height * 0.90) + (Math.random() * (height * 0.10));
-            const vx = (Math.random() * BASE_VELOCITY) + BASE_VELOCITY/2;
-            const vy = -(Math.random() * BASE_VELOCITY) - BASE_VELOCITY/2;
+        // Calculate tako (octopus) position and tip (start position for racers)
+        // Tako is in bottom left, rotated 45 degrees clockwise, positioned so tentacles are off-screen
+        const takoSize = Math.min(width, height) * 0.3; // Size of tako image
+        const takoX = takoSize * 0.25; // Further to bottom left
+        const takoY = height - takoSize * 0.25; // Further to bottom left
+        const takoRotation = 45 * Math.PI / 180; // 45 degrees clockwise
+        
+        // Calculate tip position (top center of tako head after rotation)
+        // The tip is at the top center of the tako before rotation, adjusted for visible head area
+        const tipOffsetX = 0;
+        const tipOffsetY = -takoSize * 0.3; // Top of visible head area
+        const cosRot = Math.cos(takoRotation);
+        const sinRot = Math.sin(takoRotation);
+        const tipX = takoX + (tipOffsetX * cosRot - tipOffsetY * sinRot);
+        const tipY = takoY + (tipOffsetX * sinRot + tipOffsetY * cosRot);
+
+        return HORSES_CONFIG.map((config, index) => {
+            // All racers start at the tip of the octopus with velocity 0
+            const startX = tipX + (Math.random() - 0.5) * 10; // Small random offset
+            const startY = tipY + (Math.random() - 0.5) * 10;
+            const vx = 0; // Start with zero velocity
+            const vy = 0;
+
+            // Path variation: alternate between "up then right" and "right then up" strategies
+            // Half go up-first, half go right-first
+            const goRightFirst = index % 2 === 0; // Alternate racers
+            const rightBias = goRightFirst ? 0.7 : 0.3; // Stronger horizontal component for right-first
+            const upBias = goRightFirst ? 0.3 : 0.7; // Stronger vertical component for up-first
+            
+            const targetVx = BASE_VELOCITY * (0.5 + Math.random() * 0.5) * rightBias;
+            const targetVy = -BASE_VELOCITY * (0.5 + Math.random() * 0.5) * upBias;
 
             return {
                 ...config,
                 x: startX, y: startY, 
                 vx, vy,
-                targetVx: vx, targetVy: vy,
+                targetVx, targetVy, // Varied target velocity for path diversity
                 angle: Math.atan2(vy, vx),
                 tail: [],
                 finished: false,
@@ -186,7 +222,11 @@ const App = () => {
                 collisionDirection: null, // Direction of collision (angle in radians)
                 escapeBurstFrames: 0, // Frames remaining in escape burst
                 prevX: startX, // Previous X position for stuck detection
-                prevY: startY // Previous Y position for stuck detection
+                prevY: startY, // Previous Y position for stuck detection
+                approachingObstacle: false, // Whether racer is approaching obstacle
+                avoidingObstacle: false, // Whether racer is actively avoiding obstacle
+                avoidanceDirection: null, // Direction to avoid obstacle (angle in radians)
+                baseVelocity: BASE_VELOCITY // Store base velocity for re-acceleration
             };
         });
     }, []);
@@ -197,8 +237,10 @@ const App = () => {
         if (madeTheCut) {
             const rank = rankings.indexOf(bet) + 1;
             setStatusText(`SAFE: Finished #${rank}. No signal sent.`);
+            setConsecutiveWins(prev => prev + 1); // Increment consecutive wins
         } else {
             setStatusText('DEFEAT: Did not make the cut. Transmitting penalty... ⚡');
+            setConsecutiveWins(0); // Reset consecutive wins when punishment is transferred
             try {
                 if (ESP32_IP_ADDRESS !== '192.168.4.1') {
                     fetch(API_LOSE_ENDPOINT, { method: 'POST' }).catch(e => console.warn("Signal dispatched quietly"));
@@ -212,12 +254,13 @@ const App = () => {
     }, [bet]);
 
     const gameLoop = useCallback(() => {
-        const canvas = canvasRef.current;
-        if (!canvas || gameState !== 'RACING') return;
+        try {
+            const canvas = canvasRef.current;
+            if (!canvas || gameState !== 'RACING' || countdown !== null) return; // Don't run game loop during countdown
 
-        const W = canvas.width;
-        const H = canvas.height;
-        const GOAL_RADIUS = Math.max(W, H) * 0.15;
+            const W = canvas.width;
+            const H = canvas.height;
+            const GOAL_RADIUS = Math.max(W, H) * 0.15;
 
         // Update single giant obstacle: rotation and orbital/flowing movement
         let currentObstacle = obstacle;
@@ -248,7 +291,7 @@ const App = () => {
             const newRacers = prevRacers.map(r => {
                 if (r.finished) return r;
 
-                let { x, y, vx, vy, targetVx, targetVy, angle, tail, stuck, stuckFrames, collisionDirection, escapeBurstFrames } = r;
+                let { x, y, vx, vy, targetVx, targetVy, angle, tail, stuck, stuckFrames, collisionDirection, escapeBurstFrames, approachingObstacle, avoidingObstacle, avoidanceDirection, baseVelocity } = r;
                 
                 // Track previous position to detect if stuck in place
                 const prevX = r.prevX !== undefined ? r.prevX : x;
@@ -261,47 +304,199 @@ const App = () => {
                 const horizontalLength = obstacleSize * 0.4;
                 const barThickness = obstacleSize * 0.08;
                 
-                // Obstacle avoidance - detect obstacle before collision
-                if (currentObstacle && !stuck && escapeBurstFrames === 0) {
-                    const obsDx = x - currentObstacle.x;
-                    const obsDy = y - currentObstacle.y;
-                    const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
-                    
-                    // Check if approaching obstacle
-                    if (obsDist < OBSTACLE_AVOIDANCE_DISTANCE && obsDist > racerRadius * 2) {
-                        // Check if current trajectory would hit obstacle
-                        const futureX = x + vx * 5;
-                        const futureY = y + vy * 5;
-                        const wouldHit = checkTCollision(futureX, futureY, currentObstacle.x, currentObstacle.y,
-                            currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
-                        
-                        if (wouldHit) {
-                            // Apply avoidance force perpendicular to obstacle direction
-                            const avoidAngle = Math.atan2(obsDy, obsDx) + Math.PI / 2;
-                            // Choose direction that's more towards goal
-                            const goalDx = W - x;
-                            const goalDy = 0 - y;
-                            const goalAngle = Math.atan2(goalDy, goalDx);
-                            const angleDiff1 = Math.abs(avoidAngle - goalAngle);
-                            const angleDiff2 = Math.abs((avoidAngle + Math.PI) - goalAngle);
-                            const finalAvoidAngle = angleDiff1 < angleDiff2 ? avoidAngle : avoidAngle + Math.PI;
-                            
-                            vx += Math.cos(finalAvoidAngle) * OBSTACLE_AVOIDANCE_STRENGTH;
-                            vy += Math.sin(finalAvoidAngle) * OBSTACLE_AVOIDANCE_STRENGTH;
-                        }
-                    }
-                }
-                
-                // Check if currently colliding
+                // Check if currently colliding (needed for avoidance system)
                 let isColliding = false;
                 if (currentObstacle) {
                     isColliding = checkTCollision(x, y, currentObstacle.x, currentObstacle.y, 
                         currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
                 }
                 
+                // Enhanced obstacle avoidance - smart scanning and avoidance system
+                // Always active when near obstacle or colliding
+                if (currentObstacle && escapeBurstFrames === 0) {
+                    const obsDx = x - currentObstacle.x;
+                    const obsDy = y - currentObstacle.y;
+                    const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
+                    const currentSpeed = Math.sqrt(vx * vx + vy * vy);
+                    
+                    // Check if within detection range or currently colliding
+                    // Always avoid if colliding, or if close and heading towards obstacle
+                    const futureX = x + vx * 20;
+                    const futureY = y + vy * 20;
+                    const wouldHit = checkTCollision(futureX, futureY, currentObstacle.x, currentObstacle.y,
+                        currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
+                    
+                    const shouldAvoid = isColliding || (obsDist < OBSTACLE_AVOIDANCE_DISTANCE && (wouldHit || obsDist < racerRadius * 5));
+                    
+                    if (shouldAvoid) {
+                        approachingObstacle = true;
+                        avoidingObstacle = true;
+                        
+                        // Calculate best avoidance direction with comprehensive scanning
+                        const goalDx = W - x;
+                        const goalDy = 0 - y;
+                        const goalAngle = Math.atan2(goalDy, goalDx);
+                        
+                        // Scan multiple directions (16 directions for better coverage)
+                        const avoidanceCandidates = [];
+                        const scanDirections = 16;
+                        
+                        for (let i = 0; i < scanDirections; i++) {
+                            const scanAngle = (Math.PI * 2 * i) / scanDirections;
+                            avoidanceCandidates.push({ angle: scanAngle, score: 0 });
+                        }
+                        
+                        // Score each candidate direction
+                        for (let i = 0; i < avoidanceCandidates.length; i++) {
+                            const candidate = avoidanceCandidates[i];
+                            
+                            // Test multiple points along this direction to ensure path is safe
+                            let pathSafe = true;
+                            let maxSafeDistance = 0;
+                            
+                            for (let step = 1; step <= 5; step++) {
+                                const testDistance = racerRadius * 3 * step;
+                                const testX = x + Math.cos(candidate.angle) * testDistance;
+                                const testY = y + Math.sin(candidate.angle) * testDistance;
+                                
+                                const isSafe = !checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
+                                    currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
+                                
+                                if (isSafe) {
+                                    maxSafeDistance = testDistance;
+                                } else {
+                                    if (step === 1) {
+                                        pathSafe = false; // Immediate collision
+                                    }
+                                    break;
+                                }
+                            }
+                            
+                            if (pathSafe && maxSafeDistance > 0) {
+                                // Calculate scores
+                                const testX = x + Math.cos(candidate.angle) * maxSafeDistance;
+                                const testY = y + Math.sin(candidate.angle) * maxSafeDistance;
+                                const testObsDx = testX - currentObstacle.x;
+                                const testObsDy = testY - currentObstacle.y;
+                                const testObsDist = Math.sqrt(testObsDx*testObsDx + testObsDy*testObsDy);
+                                
+                                const distanceScore = testObsDist * 3; // Strong preference for moving away
+                                const goalAlignment = Math.cos(candidate.angle - goalAngle);
+                                const goalScore = goalAlignment * 5; // Moderate goal preference
+                                const pathLengthScore = maxSafeDistance * 0.5; // Prefer longer safe paths
+                                
+                                candidate.score = distanceScore + goalScore + pathLengthScore;
+                            } else {
+                                candidate.score = -Infinity; // Unsafe direction
+                            }
+                        }
+                        
+                        // Find best avoidance direction
+                        let bestAvoidance = null;
+                        let bestScore = -Infinity;
+                        for (const candidate of avoidanceCandidates) {
+                            if (candidate.score > bestScore) {
+                                bestScore = candidate.score;
+                                bestAvoidance = candidate.angle;
+                            }
+                        }
+                        
+                        if (bestAvoidance !== null) {
+                            avoidanceDirection = bestAvoidance;
+                            
+                            // Smooth deceleration when approaching obstacle
+                            if (obsDist < OBSTACLE_DECELERATION_DISTANCE || isColliding) {
+                                const targetSpeed = Math.max(MIN_APPROACH_VELOCITY, currentSpeed * DECELERATION_FACTOR * 0.9);
+                                const decelSmoothing = 0.12; // Smooth deceleration
+                                const speedRatio = targetSpeed / Math.max(currentSpeed, 0.01);
+                                vx = vx * (1 - decelSmoothing) + vx * speedRatio * decelSmoothing;
+                                vy = vy * (1 - decelSmoothing) + vy * speedRatio * decelSmoothing;
+                            }
+                            
+                            // Smooth acceleration in the safe direction
+                            const baseAcceleration = isColliding ? OBSTACLE_AVOIDANCE_STRENGTH * 2.5 : OBSTACLE_AVOIDANCE_STRENGTH * 1.8;
+                            const accelerationStrength = baseAcceleration * (1 + (1 - obsDist / OBSTACLE_AVOIDANCE_DISTANCE) * 0.5); // Moderate strength when closer
+                            const targetAvoidanceVx = Math.cos(avoidanceDirection) * accelerationStrength;
+                            const targetAvoidanceVy = Math.sin(avoidanceDirection) * accelerationStrength;
+                            
+                            // Apply acceleration smoothly - much more gradual
+                            const avoidanceSmoothing = isColliding ? 0.15 : 0.08; // Much smoother transitions
+                            vx = vx * (1 - avoidanceSmoothing) + targetAvoidanceVx * avoidanceSmoothing;
+                            vy = vy * (1 - avoidanceSmoothing) + targetAvoidanceVy * avoidanceSmoothing;
+                            
+                            // Smoothly ensure minimum velocity when colliding
+                            if (isColliding && currentSpeed < BASE_VELOCITY * 0.3) {
+                                const minSpeed = BASE_VELOCITY * 0.4;
+                                const targetVx = (vx / Math.max(currentSpeed, 0.01)) * minSpeed;
+                                const targetVy = (vy / Math.max(currentSpeed, 0.01)) * minSpeed;
+                                const speedSmoothing = 0.1; // Smooth speed boost
+                                vx = vx * (1 - speedSmoothing) + targetVx * speedSmoothing;
+                                vy = vy * (1 - speedSmoothing) + targetVy * speedSmoothing;
+                            }
+                        } else if (isColliding) {
+                            // No safe direction found but we're colliding - smoothly try opposite of current velocity
+                            if (currentSpeed > 0.01) {
+                                const oppositeAngle = Math.atan2(vy, vx) + Math.PI;
+                                const escapeSpeed = BASE_VELOCITY * 0.8;
+                                const targetVx = Math.cos(oppositeAngle) * escapeSpeed;
+                                const targetVy = Math.sin(oppositeAngle) * escapeSpeed;
+                                const escapeSmoothing = 0.2; // Smooth transition to escape direction
+                                vx = vx * (1 - escapeSmoothing) + targetVx * escapeSmoothing;
+                                vy = vy * (1 - escapeSmoothing) + targetVy * escapeSmoothing;
+                            } else {
+                                // No velocity - smoothly push directly away from obstacle
+                                const pushX = obsDx / Math.max(obsDist, 0.1);
+                                const pushY = obsDy / Math.max(obsDist, 0.1);
+                                const targetVx = pushX * BASE_VELOCITY * 0.6;
+                                const targetVy = pushY * BASE_VELOCITY * 0.6;
+                                const pushSmoothing = 0.25; // Smooth push
+                                vx = vx * (1 - pushSmoothing) + targetVx * pushSmoothing;
+                                vy = vy * (1 - pushSmoothing) + targetVy * pushSmoothing;
+                            }
+                        }
+                    } else {
+                        // Not on collision course - might be recovering or far from obstacle
+                        if (approachingObstacle || avoidingObstacle) {
+                            // Re-accelerate after avoiding obstacle
+                            const currentSpeed = Math.sqrt(vx * vx + vy * vy);
+                            if (currentSpeed < baseVelocity) {
+                                const acceleration = Math.min(ACCELERATION_FACTOR, baseVelocity / currentSpeed);
+                                vx *= acceleration;
+                                vy *= acceleration;
+                            }
+                        }
+                        
+                        if (obsDist > OBSTACLE_AVOIDANCE_DISTANCE * 0.9) {
+                            approachingObstacle = false;
+                            avoidingObstacle = false;
+                            avoidanceDirection = null;
+                        }
+                    }
+                } else {
+                    // Not avoiding - reset flags
+                    approachingObstacle = false;
+                    avoidingObstacle = false;
+                    avoidanceDirection = null;
+                }
+                
                 // Calculate current speed and position change
+                // Safety check: ensure vx and vy are valid numbers
+                if (!isFinite(vx) || !isFinite(vy)) {
+                    vx = 0;
+                    vy = 0;
+                }
                 const currentSpeed = Math.sqrt(vx * vx + vy * vy);
                 const positionChange = Math.sqrt((x - prevX) * (x - prevX) + (y - prevY) * (y - prevY));
+                
+                // Safety check: ensure calculated values are valid
+                if (!isFinite(currentSpeed)) {
+                    vx = BASE_VELOCITY * 0.5;
+                    vy = BASE_VELOCITY * 0.5;
+                }
+                if (!isFinite(positionChange)) {
+                    // Position change invalid, but not critical
+                }
+                
                 const isMovingSlowly = currentSpeed < STUCK_VELOCITY_THRESHOLD;
                 const isStuckInPlace = positionChange < STUCK_POSITION_THRESHOLD;
                 
@@ -313,137 +508,128 @@ const App = () => {
                 const angleToGoal = Math.abs(goalAngle - currentAngle);
                 const isTryingToMoveForward = angleToGoal < Math.PI / 2 || angleToGoal > 3 * Math.PI / 2;
                 
-                // Handle collision physics
-                if (isColliding) {
-                    if (!stuck) {
-                        // Just collided - get stuck and record collision direction
-                        stuck = true;
-                        stuckFrames = 0;
-                        
-                        // Calculate collision direction (direction racer was moving when it hit)
-                        if (currentSpeed > 0.01) {
-                            collisionDirection = Math.atan2(vy, vx);
-                        } else {
-                            // If no velocity, use direction from obstacle center
-                            const obsDx = x - currentObstacle.x;
-                            const obsDy = y - currentObstacle.y;
-                            collisionDirection = Math.atan2(obsDy, obsDx);
-                        }
-                        vx = 0;
-                        vy = 0;
+                // Handle collision physics - detect stuck state and force perpendicular escape
+                if (isColliding && currentObstacle) {
+                    const obsDx = x - currentObstacle.x;
+                    const obsDy = y - currentObstacle.y;
+                    const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
+                    
+                    // Safety check: ensure obsDist is valid
+                    if (!isFinite(obsDist) || obsDist < 0.1) {
+                        // Invalid distance - use default escape
+                        vx = BASE_VELOCITY * 0.5;
+                        vy = BASE_VELOCITY * 0.5;
                     } else {
-                        // Already stuck - increment stuck frames
-                        stuckFrames++;
+                        // Calculate normal vector (away from obstacle center)
+                        const normalX = obsDx / obsDist;
+                        const normalY = obsDy / obsDist;
+                    
+                        // Check if velocity is parallel to obstacle surface (perpendicular to normal)
+                        // This causes sliding along obstacle without escaping
+                        const velocityDotNormal = vx * normalX + vy * normalY;
+                        const velocityPerpX = vx - normalX * velocityDotNormal;
+                        const velocityPerpY = vy - normalY * velocityDotNormal;
+                        let perpSpeed = Math.sqrt(velocityPerpX*velocityPerpX + velocityPerpY*velocityPerpY);
+                        let awaySpeed = Math.abs(velocityDotNormal);
                         
-                        // Check if stuck in front of obstacle (low velocity + stuck in place + trying to move forward)
-                        const isStuckInFront = isMovingSlowly && isStuckInPlace && isTryingToMoveForward;
+                        // Safety check: ensure calculated speeds are valid
+                        if (!isFinite(perpSpeed)) {
+                            perpSpeed = 0;
+                        }
+                        if (!isFinite(awaySpeed)) {
+                            awaySpeed = 0;
+                        }
                         
-                        // Trigger escape if: stuck for duration AND (very slow OR stuck in front)
-                        const shouldEscape = stuckFrames >= STUCK_DURATION && (isMovingSlowly || isStuckInFront);
+                        // Detect stuck: colliding AND (very slow OR not moving away OR sliding along surface)
+                        const isTrulyStuck = isColliding && (
+                            currentSpeed < BASE_VELOCITY * 0.15 || 
+                            positionChange < 2 || 
+                            (perpSpeed > awaySpeed * 2 && awaySpeed < BASE_VELOCITY * 0.1) // Sliding along surface
+                        );
                         
-                        if (shouldEscape && escapeBurstFrames === 0 && collisionDirection !== null) {
-                            // Intelligent escape: calculate best escape direction (ALLOW BACKWARD MOVEMENT)
-                            const obsDx = x - currentObstacle.x;
-                            const obsDy = y - currentObstacle.y;
-                            const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
+                        if (isTrulyStuck) {
+                            // Smooth perpendicular escape - push away from obstacle gradually
+                            const escapeSpeed = BASE_VELOCITY * 1.0; // Moderate escape speed
                             
-                            // Try multiple escape strategies (including backward movement)
-                            let escapeCandidates = [];
+                            // Also try to find a better escape direction by testing nearby angles
+                            let bestEscapeAngle = Math.atan2(normalY, normalX);
+                            let bestEscapeDist = 0;
                             
-                            // Strategy 1: Perpendicular to collision (left/right) - allows sideways escape
-                            const escapeAngle1 = collisionDirection + Math.PI / 2;
-                            const escapeAngle2 = collisionDirection - Math.PI / 2;
-                            escapeCandidates.push({ angle: escapeAngle1, priority: 1 });
-                            escapeCandidates.push({ angle: escapeAngle2, priority: 1 });
-                            
-                            // Strategy 2: Directly away from obstacle (BACKWARD from goal, but necessary to escape)
-                            const awayAngle = Math.atan2(obsDy, obsDx);
-                            escapeCandidates.push({ angle: awayAngle, priority: 2 });
-                            
-                            // Strategy 3: Opposite to collision direction (BACKWARD - what they came from)
-                            const oppositeAngle = collisionDirection + Math.PI;
-                            escapeCandidates.push({ angle: oppositeAngle, priority: 3 });
-                            
-                            // Strategy 4: Perpendicular away from goal (if goal pull is blocking)
-                            const perpendicularToGoal1 = goalAngle + Math.PI / 2;
-                            const perpendicularToGoal2 = goalAngle - Math.PI / 2;
-                            escapeCandidates.push({ angle: perpendicularToGoal1, priority: 2 });
-                            escapeCandidates.push({ angle: perpendicularToGoal2, priority: 2 });
-                            
-                            // Test each candidate and find the best one
-                            let bestEscape = null;
-                            let bestScore = -Infinity;
-                            
-                            for (const candidate of escapeCandidates) {
-                                const testX = x + Math.cos(candidate.angle) * racerRadius * 3;
-                                const testY = y + Math.sin(candidate.angle) * racerRadius * 3;
+                            // Test angles around the normal (perpendicular escape)
+                            for (let angleOffset = -Math.PI/3; angleOffset <= Math.PI/3; angleOffset += Math.PI/12) {
+                                const testAngle = Math.atan2(normalY, normalX) + angleOffset;
+                                const testX = x + Math.cos(testAngle) * racerRadius * 5;
+                                const testY = y + Math.sin(testAngle) * racerRadius * 5;
                                 
-                                // Check if this direction is safe (no collision)
-                                const isSafe = !checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
+                                const testSafe = !checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
                                     currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
                                 
-                                if (isSafe) {
-                                    // Score based on: safety, distance from obstacle, and priority
+                                if (testSafe) {
                                     const testObsDx = testX - currentObstacle.x;
                                     const testObsDy = testY - currentObstacle.y;
                                     const testObsDist = Math.sqrt(testObsDx*testObsDx + testObsDy*testObsDy);
                                     
-                                    // Prefer directions that move away from obstacle (most important)
-                                    const distanceScore = testObsDist * 2;
-                                    // Lower priority number = better (but distance is more important)
-                                    const priorityScore = (4 - candidate.priority) * 5;
-                                    // Small preference for directions that eventually help reach goal (but not required)
-                                    const goalAlignment = Math.cos(candidate.angle - goalAngle);
-                                    const goalScore = goalAlignment * 0.5; // Small weight
-                                    
-                                    const totalScore = distanceScore + priorityScore + goalScore;
-                                    
-                                    if (totalScore > bestScore) {
-                                        bestScore = totalScore;
-                                        bestEscape = candidate.angle;
+                                    if (testObsDist > bestEscapeDist) {
+                                        bestEscapeDist = testObsDist;
+                                        bestEscapeAngle = testAngle;
                                     }
                                 }
                             }
                             
-                            // Use best escape, or fallback to directly away from obstacle (backward if needed)
-                            const finalEscapeAngle = bestEscape !== null ? bestEscape : awayAngle;
+                            // Smoothly apply the best escape direction
+                            const targetEscapeVx = Math.cos(bestEscapeAngle) * escapeSpeed;
+                            const targetEscapeVy = Math.sin(bestEscapeAngle) * escapeSpeed;
+                            const escapeSmoothing = 0.18; // Smooth escape transition
+                            vx = vx * (1 - escapeSmoothing) + targetEscapeVx * escapeSmoothing;
+                            vy = vy * (1 - escapeSmoothing) + targetEscapeVy * escapeSmoothing;
                             
-                            vx = Math.cos(finalEscapeAngle) * ESCAPE_BURST_VELOCITY;
-                            vy = Math.sin(finalEscapeAngle) * ESCAPE_BURST_VELOCITY;
-                            escapeBurstFrames = ESCAPE_BURST_DURATION;
-                        } else if (escapeBurstFrames > 0) {
-                            // Maintain escape burst - continue in current escape direction
-                            escapeBurstFrames--;
-                            // Gradually reduce burst strength but maintain direction
-                            const currentEscapeAngle = Math.atan2(vy, vx);
-                            const burstStrength = ESCAPE_BURST_VELOCITY * (0.6 + (escapeBurstFrames / ESCAPE_BURST_DURATION) * 0.4);
-                            vx = Math.cos(currentEscapeAngle) * burstStrength;
-                            vy = Math.sin(currentEscapeAngle) * burstStrength;
-                        } else if (stuckFrames < STUCK_DURATION) {
-                            // Still in initial stuck period - no movement
-                            vx = 0;
-                            vy = 0;
+                            // Safety check: ensure velocity is valid
+                            if (!isFinite(vx) || !isFinite(vy)) {
+                                const fallbackVx = normalX * escapeSpeed;
+                                const fallbackVy = normalY * escapeSpeed;
+                                vx = vx * 0.5 + fallbackVx * 0.5;
+                                vy = vy * 0.5 + fallbackVy * 0.5;
+                            }
+                        } else if (currentSpeed < BASE_VELOCITY * 0.3) {
+                            // Not fully stuck but slow - smoothly ensure we're moving away, not along
+                            // Calculate target velocity away from obstacle
+                            const targetAwaySpeed = Math.max(awaySpeed, BASE_VELOCITY * 0.5);
+                            const targetVx = normalX * targetAwaySpeed;
+                            const targetVy = normalY * targetAwaySpeed;
+                            
+                            // Smoothly blend with current velocity to maintain momentum
+                            const blendSmoothing = 0.15; // Smooth blending
+                            vx = vx * (1 - blendSmoothing) + targetVx * blendSmoothing;
+                            vy = vy * (1 - blendSmoothing) + targetVy * blendSmoothing;
+                            
+                            // Safety check
+                            if (!isFinite(vx) || !isFinite(vy)) {
+                                vx = normalX * BASE_VELOCITY * 0.5;
+                                vy = normalY * BASE_VELOCITY * 0.5;
+                            }
                         } else {
-                            // Fallback: try to move away from obstacle
-                            const obsDx = x - currentObstacle.x;
-                            const obsDy = y - currentObstacle.y;
-                            const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
+                            // Has speed but might be sliding - smoothly ensure component away from obstacle
+                            if (velocityDotNormal < BASE_VELOCITY * 0.2) {
+                                // Not moving away enough - smoothly boost the away component
+                                const boostStrength = BASE_VELOCITY * 0.3;
+                                const boostSmoothing = 0.1; // Very smooth boost
+                                vx = vx * (1 - boostSmoothing) + (vx + normalX * boostStrength) * boostSmoothing;
+                                vy = vy * (1 - boostSmoothing) + (vy + normalY * boostStrength) * boostSmoothing;
+                            }
                             
-                            if (obsDist > 0.1) {
-                                const escapeX = (obsDx / obsDist) * WIGGLE_STRENGTH * 2;
-                                const escapeY = (obsDy / obsDist) * WIGGLE_STRENGTH * 2;
-                                vx = escapeX;
-                                vy = escapeY;
-                            } else {
-                                // Random wiggle if at center
-                                const wiggleAngle = Math.random() * Math.PI * 2;
-                                vx = Math.cos(wiggleAngle) * WIGGLE_STRENGTH;
-                                vy = Math.sin(wiggleAngle) * WIGGLE_STRENGTH;
+                            // Safety check
+                            if (!isFinite(vx) || !isFinite(vy)) {
+                                vx = normalX * BASE_VELOCITY * 0.5;
+                                vy = normalY * BASE_VELOCITY * 0.5;
                             }
                         }
                     }
+                    
+                    // Reset stuck state - we're handling escape
+                    stuck = false;
+                    stuckFrames = 0;
                 } else {
-                    // Not colliding - if was stuck, clear stuck state
+                    // Not colliding - clear stuck state
                     if (stuck) {
                         stuck = false;
                         stuckFrames = 0;
@@ -452,7 +638,8 @@ const App = () => {
                     }
                     
                     // Normal movement (only when not stuck and not in escape burst)
-                    if (escapeBurstFrames === 0) {
+                    // Only move if countdown is finished
+                    if (escapeBurstFrames === 0 && countdown === null) {
                         vx += (targetVx - vx) * TARGET_SMOOTHING;
                         vy += (targetVy - vy) * TARGET_SMOOTHING;
                         
@@ -482,83 +669,179 @@ const App = () => {
                     }
                 }
 
-                // Calculate new position
+                // Calculate new position - safety check first
+                if (!isFinite(vx)) vx = 0;
+                if (!isFinite(vy)) vy = 0;
+                if (!isFinite(x)) x = 0;
+                if (!isFinite(y)) y = 0;
+                
                 const newX = x + vx;
                 const newY = y + vy;
                 
-                // Check T-shaped collision before moving - ALWAYS check, even when stuck
-                let canMove = true;
+                // Check T-shaped collision before moving - prevent passing through
                 if (currentObstacle) {
                     const willCollide = checkTCollision(newX, newY, currentObstacle.x, currentObstacle.y,
                         currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
                     
                     if (willCollide) {
-                        canMove = false;
-                        // Prevent any movement into the obstacle
-                        vx = 0;
-                        vy = 0;
+                        // Prevent passing through - don't move into obstacle
+                        // Calculate normal from obstacle center to racer
+                        const obsDx = x - currentObstacle.x;
+                        const obsDy = y - currentObstacle.y;
+                        const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
                         
-                        // If stuck and wiggling, try to find escape path
-                        if (stuck && stuckFrames >= STUCK_DURATION) {
-                            // Try multiple escape directions
-                            let foundEscape = false;
-                            for (let i = 0; i < 8; i++) {
-                                const escapeAngle = (Math.PI * 2 * i) / 8;
-                                const safeDistance = racerRadius * 3;
-                                const testX = x + Math.cos(escapeAngle) * safeDistance;
-                                const testY = y + Math.sin(escapeAngle) * safeDistance;
-                                
-                                // Check if escape position is safe
-                                const escapeSafe = !checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
+                        // Initialize normal vectors with safe defaults
+                        let normalX = 1;
+                        let normalY = 0;
+                        
+                        if (obsDist > 0.1 && isFinite(obsDist)) {
+                            normalX = obsDx / obsDist;
+                            normalY = obsDy / obsDist;
+                            
+                            // Safety check: ensure normal is valid
+                            if (!isFinite(normalX) || !isFinite(normalY)) {
+                                normalX = 1;
+                                normalY = 0;
+                            }
+                            
+                            const dot = vx * normalX + vy * normalY;
+                            
+                            // Smoothly remove velocity component towards obstacle
+                            if (dot > 0 && isFinite(dot)) {
+                                const removalSmoothing = 0.3; // Smooth removal
+                                const removedVx = normalX * dot;
+                                const removedVy = normalY * dot;
+                                vx = vx * (1 - removalSmoothing) + (vx - removedVx) * removalSmoothing;
+                                vy = vy * (1 - removalSmoothing) + (vy - removedVy) * removalSmoothing;
+                            }
+                            
+                            // If velocity is now too small or parallel to surface, smoothly add escape component
+                            const currentSpeed = Math.sqrt(vx * vx + vy * vy);
+                            if (isFinite(currentSpeed) && currentSpeed < BASE_VELOCITY * 0.2) {
+                                // Smoothly add escape velocity perpendicular to obstacle
+                                const escapeBoost = BASE_VELOCITY * 0.6;
+                                const escapeSmoothing = 0.2; // Smooth escape boost
+                                vx = vx * (1 - escapeSmoothing) + (vx + normalX * escapeBoost) * escapeSmoothing;
+                                vy = vy * (1 - escapeSmoothing) + (vy + normalY * escapeBoost) * escapeSmoothing;
+                            }
+                        } else {
+                            // Invalid distance - set default escape velocity
+                            vx = BASE_VELOCITY * 0.5;
+                            vy = BASE_VELOCITY * 0.5;
+                        }
+                        
+                        // Final safety check on velocity
+                        if (!isFinite(vx) || !isFinite(vy)) {
+                            vx = BASE_VELOCITY * 0.5;
+                            vy = BASE_VELOCITY * 0.5;
+                        }
+                        
+                        // Try to find a safe position along the movement vector (small steps)
+                        // But prioritize moving away from obstacle
+                        const originalVx = newX - x;
+                        const originalVy = newY - y;
+                        let foundSafePosition = false;
+                        let lastSafeX = x;
+                        let lastSafeY = y;
+                        
+                        // First, try moving directly away from obstacle
+                        if (obsDist > 0.1 && isFinite(obsDist) && isFinite(normalX) && isFinite(normalY)) {
+                            const escapeX = x + normalX * racerRadius * 2;
+                            const escapeY = y + normalY * racerRadius * 2;
+                            
+                            // Safety check on escape position
+                            if (isFinite(escapeX) && isFinite(escapeY)) {
+                                const escapeSafe = !checkTCollision(escapeX, escapeY, currentObstacle.x, currentObstacle.y,
                                     currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
                                 
                                 if (escapeSafe) {
-                                    // Move towards escape position (small step)
-                                    const stepSize = racerRadius * 0.5;
-                                    x = x + Math.cos(escapeAngle) * stepSize;
-                                    y = y + Math.sin(escapeAngle) * stepSize;
-                                    vx = Math.cos(escapeAngle) * WIGGLE_STRENGTH;
-                                    vy = Math.sin(escapeAngle) * WIGGLE_STRENGTH;
-                                    foundEscape = true;
+                                    x = escapeX;
+                                    y = escapeY;
+                                    foundSafePosition = true;
+                                }
+                            }
+                        }
+                        
+                        // If direct escape didn't work, try along movement vector
+                        if (!foundSafePosition && isFinite(originalVx) && isFinite(originalVy)) {
+                            for (let step = 0.05; step <= 1.0; step += 0.05) {
+                                const testX = x + originalVx * step;
+                                const testY = y + originalVy * step;
+                                
+                                // Safety check on test position
+                                if (!isFinite(testX) || !isFinite(testY)) {
+                                    break;
+                                }
+                                
+                                const testSafe = !checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
+                                    currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
+                                
+                                if (testSafe) {
+                                    lastSafeX = testX;
+                                    lastSafeY = testY;
+                                    foundSafePosition = true;
+                                } else {
+                                    // Hit obstacle - use last safe position
                                     break;
                                 }
                             }
                             
-                            if (!foundEscape) {
-                                // Can't escape yet, stay in place
-                                vx = 0;
-                                vy = 0;
+                            if (foundSafePosition && isFinite(lastSafeX) && isFinite(lastSafeY)) {
+                                // Move to the furthest safe position
+                                x = lastSafeX;
+                                y = lastSafeY;
+                            } else {
+                                // Can't move forward at all - stay at current position
+                                // Escape velocity has been set above
                             }
                         }
+                    } else {
+                        // Safe to move to new position
+                        x = newX;
+                        y = newY;
                     }
-                }
-                
-                // Only update position if no collision detected and we're not handling escape
-                if (canMove) {
+                } else {
+                    // No obstacle, safe to move
                     x = newX;
                     y = newY;
                 }
 
+                // Safety check: ensure x and y are valid before wall checks
+                if (!isFinite(x)) x = 0;
+                if (!isFinite(y)) y = 0;
+                if (!isFinite(vx)) vx = 0;
+                if (!isFinite(vy)) vy = 0;
+                
                 if (x < 0) { x = 0; vx *= -WALL_BOUNCE_DAMPING; }
                 if (x > W) { x = W; vx *= -WALL_BOUNCE_DAMPING; }
                 if (y < 0) { y = 0; vy *= -WALL_BOUNCE_DAMPING; }
                 if (y > H) { y = H; vy *= -WALL_BOUNCE_DAMPING; }
                 
+                // Final safety check before calculating angle
+                if (!isFinite(vx)) vx = 0;
+                if (!isFinite(vy)) vy = 0;
                 angle = Math.atan2(vy, vx);
+                
+                // Safety check on angle
+                if (!isFinite(angle)) angle = 0;
 
                 tail = [...tail, { x, y }];
                 if (tail.length > TAIL_LENGTH) tail.shift();
 
                 const distToCorner = Math.sqrt(Math.pow(W - x, 2) + Math.pow(0 - y, 2));
                 if (distToCorner < GOAL_RADIUS) {
+                    setGoalReached(true); // Mark goal as reached (turns yellow)
                     return { ...r, x, y, vx: 0, vy: 0, finished: true, finalX: x, finalY: y };
                 }
 
-                return { ...r, x, y, vx, vy, targetVx, targetVy, angle, tail, stuck, stuckFrames, collisionDirection, escapeBurstFrames, prevX: x, prevY: y };
+                return { ...r, x, y, vx, vy, targetVx, targetVy, angle, tail, stuck, stuckFrames, collisionDirection, escapeBurstFrames, prevX: x, prevY: y, approachingObstacle, avoidingObstacle, avoidanceDirection, baseVelocity };
+            }).filter(r => {
+                // Filter out any racers with invalid positions
+                return r && isFinite(r.x) && isFinite(r.y) && isFinite(r.vx) && isFinite(r.vy);
             });
 
             newRacers.forEach(r => {
-                if (r.finished && !currentFinishers.includes(r.id)) {
+                if (r && r.finished && !currentFinishers.includes(r.id)) {
                     currentFinishers.push(r.id);
                 }
             });
@@ -575,10 +858,24 @@ const App = () => {
             return newRacers;
         });
 
-        if (gameState === 'RACING') {
-            animationFrameRef.current = requestAnimationFrame(gameLoop);
+            if (gameState === 'RACING') {
+                animationFrameRef.current = requestAnimationFrame(gameLoop);
+            }
+        } catch (error) {
+            console.error('Error in gameLoop:', error);
+            // Reset racers to safe state if error occurs
+            setRacers(prevRacers => {
+                if (!prevRacers || prevRacers.length === 0) return prevRacers;
+                return prevRacers.map(r => ({
+                    ...r,
+                    vx: (r && isFinite(r.vx)) ? r.vx : BASE_VELOCITY * 0.5,
+                    vy: (r && isFinite(r.vy)) ? r.vy : BASE_VELOCITY * 0.5,
+                    x: (r && isFinite(r.x)) ? r.x : 0,
+                    y: (r && isFinite(r.y)) ? r.y : 0
+                }));
+            });
         }
-    }, [gameState, finishedRankings, difficulty, obstacle]);
+    }, [gameState, finishedRankings, difficulty, obstacle, countdown]);
 
     const draw = useCallback(() => {
         const canvas = canvasRef.current;
@@ -597,8 +894,32 @@ const App = () => {
         ctx.beginPath(); ctx.moveTo(W, 0);
         ctx.arc(W, 0, GOAL_RADIUS, Math.PI / 2, Math.PI, false);
         ctx.closePath();
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.05)'; ctx.fill();
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)'; ctx.lineWidth = 2; ctx.stroke();
+        // Goal turns yellow (egg yolk color) when reached
+        if (goalReached) {
+            ctx.fillStyle = 'rgba(255, 220, 100, 0.4)'; // Egg yolk yellow
+            ctx.strokeStyle = 'rgba(255, 200, 50, 0.8)';
+        } else {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+        }
+        ctx.fill();
+        ctx.lineWidth = 2; ctx.stroke();
+        
+        // Draw tako (octopus) image in bottom left, rotated 45 degrees clockwise
+        // Positioned so tentacles are naturally off-screen
+        if (takoImageRef.current && takoImageRef.current.complete) {
+            const takoSize = Math.min(W, H) * 0.3;
+            const takoX = takoSize * 0.25; // Further to bottom left
+            const takoY = H - takoSize * 0.25; // Further to bottom left
+            
+            ctx.save();
+            ctx.translate(takoX, takoY);
+            ctx.rotate(45 * Math.PI / 180); // 45 degrees clockwise
+            
+            // No clipping needed - tentacles are naturally off-screen due to position
+            ctx.drawImage(takoImageRef.current, -takoSize * 0.5, -takoSize * 0.5, takoSize, takoSize);
+            ctx.restore();
+        }
         
         if (obstacle) {
             ctx.save();
@@ -687,7 +1008,38 @@ const App = () => {
                 ctx.restore();
             }
         });
-    }, [racers, dust, obstacle, bet]);
+    }, [racers, dust, obstacle, bet, goalReached]);
+
+    // Load tako (octopus) image
+    useEffect(() => {
+        const img = new Image();
+        img.src = '/tako.png';
+        img.onload = () => {
+            takoImageRef.current = img;
+        };
+        img.onerror = () => {
+            console.warn('Tako image not found. Please place tako.png in the public folder.');
+        };
+    }, []);
+
+    // Countdown timer
+    useEffect(() => {
+        if (countdown !== null && countdown > 0 && gameState === 'RACING') {
+            const timer = setTimeout(() => {
+                setCountdown(countdown - 1);
+            }, 1000);
+            return () => clearTimeout(timer);
+        } else if (countdown === 0) {
+            // Countdown finished - start the race
+            setCountdown(null);
+            // Give racers initial velocity based on their target velocities (maintains path variation)
+            setRacers(prevRacers => prevRacers.map(r => ({
+                ...r,
+                vx: r.targetVx || ((Math.random() * BASE_VELOCITY) + BASE_VELOCITY/2),
+                vy: r.targetVy || (-(Math.random() * BASE_VELOCITY) - BASE_VELOCITY/2)
+            })));
+        }
+    }, [countdown, gameState]);
 
     useEffect(() => {
         const resizeCanvas = () => {
@@ -805,63 +1157,276 @@ const App = () => {
             </div>
 
             {gameState === 'RACING' && (
-                <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 5000, pointerEvents: 'none' }}>
-                    {racers.map(r => <RacerOutline key={r.id} racer={r} />)}
-                </div>
+                <>
+                    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 5000, pointerEvents: 'none' }}>
+                        {racers.map(r => <RacerOutline key={r.id} racer={r} />)}
+                    </div>
+                    {/* Countdown display */}
+                    {countdown !== null && countdown > 0 && (
+                        <div style={{ 
+                            position: 'fixed', 
+                            top: '50%', 
+                            left: '50%', 
+                            transform: 'translate(-50%, -50%)',
+                            zIndex: 20000, 
+                            pointerEvents: 'none',
+                            textAlign: 'center'
+                        }}>
+                            <div style={{ 
+                                fontSize: '120px', 
+                                fontWeight: '900', 
+                                color: '#ffffff',
+                                textShadow: '0 0 40px rgba(255, 255, 255, 0.8), 0 0 80px rgba(255, 255, 255, 0.5)',
+                                lineHeight: '1',
+                                animation: 'pulse 0.5s ease-in-out'
+                            }}>
+                                {countdown}
+                            </div>
+                        </div>
+                    )}
+                    {/* Win streak display during race */}
+                    {consecutiveWins > 0 && countdown === null && (
+                        <div style={{ 
+                            position: 'fixed', 
+                            top: '20px', 
+                            right: '20px', 
+                            zIndex: 10001, 
+                            pointerEvents: 'none',
+                            backgroundColor: 'rgba(16, 185, 129, 0.15)',
+                            backdropFilter: 'blur(8px)',
+                            border: '1px solid rgba(16, 185, 129, 0.3)',
+                            borderRadius: '12px',
+                            padding: '12px 20px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '10px',
+                            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)'
+                        }}>
+                            <span style={{ fontSize: '20px' }}>🔥</span>
+                            <div>
+                                <div style={{ fontSize: '11px', color: '#6ee7b7', textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: 'bold' }}>Win Streak</div>
+                                <div style={{ fontSize: '24px', color: '#10b981', fontWeight: '900', lineHeight: '1' }}>{consecutiveWins}</div>
+                            </div>
+                        </div>
+                    )}
+                </>
             )}
 
             <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 10000, pointerEvents: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
                 {gameState === 'SETUP' && (
-                    <div style={{ pointerEvents: 'auto', backgroundColor: 'rgba(17, 24, 39, 0.95)', backdropFilter: 'blur(12px)', borderRadius: '24px', border: '1px solid rgba(255, 255, 255, 0.1)', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)', padding: '32px', maxWidth: '600px', width: '100%' }}>
-                        <h1 style={{ fontSize: '36px', fontWeight: '900', color: '#ffffff', textAlign: 'center', marginBottom: '32px', letterSpacing: '-0.02em' }}>MICRO DERBY</h1>
-                        
-                        <div style={{ backgroundColor: 'rgba(0, 0, 0, 0.4)', padding: '24px', borderRadius: '16px', marginBottom: '32px', border: '1px solid rgba(255, 255, 255, 0.05)' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', color: '#d1d5db', fontSize: '12px', fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
-                                <span>Risk Level</span>
-                                <span style={{ color: '#818cf8', fontWeight: 'bold' }}>TOP {difficulty} Finishers</span>
+                    <div style={{ pointerEvents: 'auto', backgroundColor: 'rgba(17, 24, 39, 0.98)', backdropFilter: 'blur(16px)', borderRadius: '28px', border: '1px solid rgba(255, 255, 255, 0.12)', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05)', padding: '40px', maxWidth: '650px', width: '100%' }}>
+                        <div style={{ textAlign: 'center', marginBottom: '8px' }}>
+                            <h1 style={{ fontSize: '42px', fontWeight: '900', background: 'linear-gradient(135deg, #ffffff 0%, #a0aec0 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', marginBottom: '8px', letterSpacing: '-0.03em' }}>MICRO DERBY</h1>
+                            <p style={{ fontSize: '13px', color: '#9ca3af', letterSpacing: '0.05em', textTransform: 'uppercase' }}>Experimental Racing Simulation</p>
+                        </div>
+
+                        {/* Win streak display in setup */}
+                        {consecutiveWins > 0 && (
+                            <div style={{ 
+                                backgroundColor: 'rgba(16, 185, 129, 0.15)', 
+                                border: '1px solid rgba(16, 185, 129, 0.3)',
+                                borderRadius: '12px', 
+                                padding: '16px', 
+                                marginBottom: '32px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                gap: '12px'
+                            }}>
+                                <span style={{ fontSize: '24px' }}>🔥</span>
+                                <div style={{ textAlign: 'center' }}>
+                                    <div style={{ fontSize: '11px', color: '#6ee7b7', textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: 'bold', marginBottom: '4px' }}>Current Win Streak</div>
+                                    <div style={{ fontSize: '32px', color: '#10b981', fontWeight: '900', lineHeight: '1' }}>{consecutiveWins}</div>
+                                </div>
                             </div>
-                            <input type="range" min="1" max="8" step="1" value={difficulty} onChange={(e) => setDifficulty(Number(e.target.value))} style={{ width: '100%', height: '8px', borderRadius: '4px', backgroundColor: '#374151', outline: 'none', cursor: 'pointer', WebkitAppearance: 'none', appearance: 'none' }} />
-                            <p style={{ textAlign: 'center', color: '#6b7280', fontSize: '12px', marginTop: '12px', marginBottom: 0 }}>
-                                Race ends when {difficulty} racers reach the goal. You must be one of them.
+                        )}
+                        
+                        <div style={{ backgroundColor: 'rgba(0, 0, 0, 0.5)', padding: '28px', borderRadius: '20px', marginBottom: '32px', border: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', color: '#d1d5db', fontSize: '13px', fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+                                <span style={{ fontWeight: '600' }}>Risk Level</span>
+                                <span style={{ color: '#818cf8', fontWeight: 'bold', fontSize: '14px' }}>TOP {difficulty} Finishers</span>
+                            </div>
+                            <input 
+                                type="range" 
+                                min="1" 
+                                max="8" 
+                                step="1" 
+                                value={difficulty} 
+                                onChange={(e) => setDifficulty(Number(e.target.value))} 
+                                style={{ 
+                                    width: '100%', 
+                                    height: '10px', 
+                                    borderRadius: '5px', 
+                                    background: 'linear-gradient(to right, #4f46e5 0%, #818cf8 50%, #a5b4fc 100%)',
+                                    outline: 'none', 
+                                    cursor: 'pointer', 
+                                    WebkitAppearance: 'none', 
+                                    appearance: 'none'
+                                }} 
+                            />
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', fontSize: '11px', color: '#6b7280' }}>
+                                <span>Easier</span>
+                                <span>Harder</span>
+                            </div>
+                            <p style={{ textAlign: 'center', color: '#9ca3af', fontSize: '13px', marginTop: '16px', marginBottom: 0, lineHeight: '1.5' }}>
+                                Race ends when <strong style={{ color: '#d1d5db' }}>{difficulty}</strong> racer{difficulty !== 1 ? 's' : ''} reach the goal. You must be one of them.
                             </p>
                         </div>
 
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px' }}>
-                            {HORSES_CONFIG.map(h => (
-                                <button key={h.id} onClick={() => { setBet(h.id); setRacers(initializeRace(window.innerWidth, window.innerHeight)); gameStateRef.current = 'RACING'; setGameState('RACING'); }} onMouseEnter={(e) => { e.currentTarget.style.transform = 'scale(1.05)'; e.currentTarget.style.backgroundColor = 'rgba(55, 65, 81, 0.7)'; }} onMouseLeave={(e) => { e.currentTarget.style.transform = 'scale(1)'; e.currentTarget.style.backgroundColor = 'rgba(31, 41, 55, 0.5)'; }} style={{ padding: '16px', borderRadius: '16px', border: `2px solid ${bet === h.id ? h.color : 'transparent'}`, backgroundColor: 'rgba(31, 41, 55, 0.5)', cursor: 'pointer', transition: 'all 0.2s', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'hidden' }}>
-                                    <span style={{ fontSize: '36px', marginBottom: '8px', filter: bet === h.id ? 'grayscale(0)' : 'grayscale(1)' }}>{h.emoji}</span>
-                                    <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: '4px', backgroundColor: h.color, opacity: 0.5 }} />
-                                </button>
-                            ))}
+                        <div style={{ marginBottom: '24px' }}>
+                            <div style={{ fontSize: '12px', color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '16px', textAlign: 'center', fontWeight: '600' }}>Select Your Racer</div>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
+                                {HORSES_CONFIG.map(h => (
+                                    <button 
+                                        key={h.id} 
+                                        onClick={() => { setBet(h.id); setRacers(initializeRace(window.innerWidth, window.innerHeight)); gameStateRef.current = 'RACING'; setGameState('RACING'); }} 
+                                        onMouseEnter={(e) => { 
+                                            e.currentTarget.style.transform = 'scale(1.08) translateY(-2px)'; 
+                                            e.currentTarget.style.backgroundColor = 'rgba(55, 65, 81, 0.8)'; 
+                                            e.currentTarget.style.boxShadow = `0 8px 16px rgba(0, 0, 0, 0.4), 0 0 0 2px ${h.color}40`;
+                                        }} 
+                                        onMouseLeave={(e) => { 
+                                            e.currentTarget.style.transform = 'scale(1) translateY(0)'; 
+                                            e.currentTarget.style.backgroundColor = 'rgba(31, 41, 55, 0.6)'; 
+                                            e.currentTarget.style.boxShadow = bet === h.id ? `0 4px 12px rgba(0, 0, 0, 0.3), 0 0 0 2px ${h.color}` : '0 4px 12px rgba(0, 0, 0, 0.3)';
+                                        }} 
+                                        style={{ 
+                                            padding: '20px 12px', 
+                                            borderRadius: '16px', 
+                                            border: `2px solid ${bet === h.id ? h.color : 'rgba(255, 255, 255, 0.1)'}`, 
+                                            backgroundColor: bet === h.id ? 'rgba(31, 41, 55, 0.8)' : 'rgba(31, 41, 55, 0.6)', 
+                                            cursor: 'pointer', 
+                                            transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)', 
+                                            display: 'flex', 
+                                            flexDirection: 'column', 
+                                            alignItems: 'center', 
+                                            justifyContent: 'center', 
+                                            position: 'relative', 
+                                            overflow: 'hidden',
+                                            boxShadow: bet === h.id ? `0 4px 12px rgba(0, 0, 0, 0.3), 0 0 0 2px ${h.color}` : '0 4px 12px rgba(0, 0, 0, 0.3)'
+                                        }}
+                                    >
+                                        <span style={{ fontSize: '40px', marginBottom: '8px', filter: bet === h.id ? 'grayscale(0) brightness(1.1)' : 'grayscale(0.3)', transition: 'filter 0.3s' }}>{h.emoji}</span>
+                                        <div style={{ fontSize: '10px', color: '#9ca3af', fontWeight: '600', textAlign: 'center' }}>{h.name}</div>
+                                        {bet === h.id && (
+                                            <div style={{ 
+                                                position: 'absolute', 
+                                                bottom: 0, 
+                                                left: 0, 
+                                                right: 0, 
+                                                height: '3px', 
+                                                background: `linear-gradient(90deg, transparent, ${h.color}, transparent)`,
+                                                animation: 'pulse 2s ease-in-out infinite'
+                                            }} />
+                                        )}
+                                    </button>
+                                ))}
+                            </div>
                         </div>
                     </div>
                 )}
 
                 {gameState === 'FINISHED' && (
-                    <div style={{ pointerEvents: 'auto', backgroundColor: 'rgba(17, 24, 39, 0.95)', backdropFilter: 'blur(12px)', borderRadius: '24px', border: '1px solid rgba(255, 255, 255, 0.1)', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)', padding: '32px', maxWidth: '500px', width: '100%', textAlign: 'center' }}>
-                        <h2 style={{ fontSize: '28px', fontWeight: '900', color: '#ffffff', marginBottom: '24px' }}>EXPERIMENT COMPLETE</h2>
+                    <div style={{ pointerEvents: 'auto', backgroundColor: 'rgba(17, 24, 39, 0.98)', backdropFilter: 'blur(16px)', borderRadius: '28px', border: '1px solid rgba(255, 255, 255, 0.12)', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05)', padding: '40px', maxWidth: '550px', width: '100%', textAlign: 'center' }}>
+                        <div style={{ marginBottom: '32px' }}>
+                            <h2 style={{ fontSize: '32px', fontWeight: '900', color: statusText.includes('DEFEAT') ? '#ffffff' : '#10b981', textShadow: statusText.includes('DEFEAT') ? '0 0 20px rgba(220, 38, 38, 0.8), 0 2px 4px rgba(0, 0, 0, 0.5)' : '0 0 20px rgba(16, 185, 129, 0.5), 0 2px 4px rgba(0, 0, 0, 0.5)', marginBottom: '12px', letterSpacing: '-0.02em' }}>
+                                {statusText.includes('DEFEAT') ? 'EXPERIMENT FAILED' : 'EXPERIMENT SUCCESS'}
+                            </h2>
+                            <div style={{ fontSize: '16px', fontWeight: 'bold', color: statusText.includes('DEFEAT') ? '#ffffff' : '#10b981', padding: '12px 20px', backgroundColor: statusText.includes('DEFEAT') ? 'rgba(220, 38, 38, 0.9)' : 'rgba(16, 185, 129, 0.1)', borderRadius: '12px', border: `1px solid ${statusText.includes('DEFEAT') ? 'rgba(220, 38, 38, 1)' : 'rgba(16, 185, 129, 0.3)'}`, display: 'inline-block' }}>
+                                {statusText}
+                            </div>
+                        </div>
+
+                        {/* Win streak display in results */}
+                        {consecutiveWins > 0 && (
+                            <div style={{ 
+                                backgroundColor: 'rgba(16, 185, 129, 0.15)', 
+                                border: '1px solid rgba(16, 185, 129, 0.3)',
+                                borderRadius: '16px', 
+                                padding: '20px', 
+                                marginBottom: '32px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                gap: '16px'
+                            }}>
+                                <span style={{ fontSize: '32px' }}>🔥</span>
+                                <div style={{ textAlign: 'center' }}>
+                                    <div style={{ fontSize: '12px', color: '#6ee7b7', textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: 'bold', marginBottom: '6px' }}>Current Win Streak</div>
+                                    <div style={{ fontSize: '40px', color: '#10b981', fontWeight: '900', lineHeight: '1' }}>{consecutiveWins}</div>
+                                </div>
+                            </div>
+                        )}
                         
-                        <div style={{ marginBottom: '32px', textAlign: 'left', backgroundColor: 'rgba(0, 0, 0, 0.3)', padding: '16px', borderRadius: '12px', maxHeight: '240px', overflowY: 'auto' }}>
-                            <h3 style={{ fontSize: '10px', fontWeight: 'bold', color: '#6b7280', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Qualified Specimens (Top {difficulty})</h3>
+                        <div style={{ marginBottom: '32px', textAlign: 'left', backgroundColor: 'rgba(0, 0, 0, 0.4)', padding: '20px', borderRadius: '16px', border: '1px solid rgba(255, 255, 255, 0.08)', maxHeight: '280px', overflowY: 'auto' }}>
+                            <h3 style={{ fontSize: '11px', fontWeight: 'bold', color: '#9ca3af', marginBottom: '16px', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Qualified Specimens (Top {difficulty})</h3>
                             <ol style={{ listStyle: 'none', padding: 0, margin: 0 }}>
                                 {finishedRankings.map((rId, idx) => {
                                     const racer = HORSES_CONFIG.find(h => h.id === rId);
                                     const isMyBet = rId === bet;
                                     return (
-                                        <li key={rId} style={{ display: 'flex', alignItems: 'center', padding: '8px', borderRadius: '8px', marginBottom: '8px', backgroundColor: isMyBet ? 'rgba(99, 102, 241, 0.3)' : 'transparent', border: isMyBet ? '1px solid rgba(99, 102, 241, 0.5)' : 'none' }}>
-                                            <span style={{ color: '#6b7280', fontFamily: 'monospace', width: '24px' }}>{idx + 1}.</span>
-                                            <span style={{ marginRight: '8px', fontSize: '20px' }}>{racer.emoji}</span>
-                                            <span style={{ color: isMyBet ? '#ffffff' : '#d1d5db', fontWeight: isMyBet ? 'bold' : 'normal', flex: 1 }}>{racer.name}</span>
-                                            {isMyBet && <span style={{ fontSize: '10px', backgroundColor: '#6366f1', color: '#ffffff', padding: '4px 8px', borderRadius: '12px', marginLeft: 'auto' }}>YOU</span>}
+                                        <li key={rId} style={{ 
+                                            display: 'flex', 
+                                            alignItems: 'center', 
+                                            padding: '12px', 
+                                            borderRadius: '12px', 
+                                            marginBottom: '8px', 
+                                            backgroundColor: isMyBet ? 'rgba(99, 102, 241, 0.2)' : 'rgba(255, 255, 255, 0.03)', 
+                                            border: isMyBet ? `1px solid ${racer.color}60` : '1px solid rgba(255, 255, 255, 0.05)',
+                                            transition: 'all 0.2s'
+                                        }}>
+                                            <span style={{ color: '#6b7280', fontFamily: 'monospace', width: '28px', fontSize: '14px', fontWeight: 'bold' }}>{idx + 1}.</span>
+                                            <span style={{ marginRight: '12px', fontSize: '24px' }}>{racer.emoji}</span>
+                                            <span style={{ color: isMyBet ? '#ffffff' : '#d1d5db', fontWeight: isMyBet ? 'bold' : '600', flex: 1, fontSize: '14px' }}>{racer.name}</span>
+                                            {isMyBet && (
+                                                <span style={{ 
+                                                    fontSize: '11px', 
+                                                    backgroundColor: racer.color, 
+                                                    color: '#ffffff', 
+                                                    padding: '6px 12px', 
+                                                    borderRadius: '12px', 
+                                                    marginLeft: 'auto',
+                                                    fontWeight: 'bold',
+                                                    textTransform: 'uppercase',
+                                                    letterSpacing: '0.05em'
+                                                }}>YOU</span>
+                                            )}
                                         </li>
                                     );
                                 })}
                             </ol>
                         </div>
 
-                        <div style={{ fontSize: '18px', fontWeight: 'bold', marginBottom: '24px', color: statusText.includes('DEFEAT') ? '#f87171' : '#4ade80' }}>{statusText}</div>
-
-                        <button onClick={() => { gameStateRef.current = 'SETUP'; setGameState('SETUP'); }} onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#e5e7eb'} onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#ffffff'} style={{ width: '100%', backgroundColor: '#ffffff', color: '#000000', padding: '16px 32px', borderRadius: '12px', fontWeight: 'bold', fontSize: '14px', letterSpacing: '0.05em', border: 'none', cursor: 'pointer', transition: 'background-color 0.2s' }}>RUN NEW TEST</button>
+                        <button 
+                            onClick={() => { gameStateRef.current = 'SETUP'; setGameState('SETUP'); }} 
+                            onMouseEnter={(e) => {
+                                e.currentTarget.style.backgroundColor = '#f3f4f6';
+                                e.currentTarget.style.transform = 'translateY(-2px)';
+                                e.currentTarget.style.boxShadow = '0 8px 16px rgba(0, 0, 0, 0.3)';
+                            }} 
+                            onMouseLeave={(e) => {
+                                e.currentTarget.style.backgroundColor = '#ffffff';
+                                e.currentTarget.style.transform = 'translateY(0)';
+                                e.currentTarget.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.2)';
+                            }} 
+                            style={{ 
+                                width: '100%', 
+                                backgroundColor: '#ffffff', 
+                                color: '#000000', 
+                                padding: '18px 32px', 
+                                borderRadius: '16px', 
+                                fontWeight: 'bold', 
+                                fontSize: '15px', 
+                                letterSpacing: '0.05em', 
+                                border: 'none', 
+                                cursor: 'pointer', 
+                                transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+                                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.2)',
+                                textTransform: 'uppercase'
+                            }}
+                        >
+                            Run New Test
+                        </button>
                     </div>
                 )}
             </div>
@@ -869,4 +1434,4 @@ const App = () => {
     );
 };
 
-export default App;
+export default App; 
