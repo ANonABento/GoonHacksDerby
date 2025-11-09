@@ -8,8 +8,8 @@ const API_LOSE_ENDPOINT = `http://${ESP32_IP_ADDRESS}/lose`;
 const RACER_SIZE = 3;
 const TAIL_LENGTH = 20; // Shorter tail
 const TRACK_COLOR = '#1a1a1a'; // Dark greyish with dirty black
-const RACER_WIDTH = 4; // Width for oval shape
-const RACER_HEIGHT = 2; // Height for oval shape
+const RACER_WIDTH = 5; // Width for oval shape
+const RACER_HEIGHT = 3; // Height for oval shape
 
 const HORSES_CONFIG = [
     { id: 1, name: "Red Shift", color: '#ff4d4f', emoji: '🔴' },
