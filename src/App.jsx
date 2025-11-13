@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 // --- CONFIGURATION CONSTANTS ---
-const ESP32_IP_ADDRESS = '192.168.4.1'; 
+const ESP32_IP_ADDRESS = 'IP_ADDRESS_HERE'; 
 const API_LOSE_ENDPOINT = `http://${ESP32_IP_ADDRESS}/lose`;
 
 const RACER_SIZE = 3;
@@ -14,9 +14,9 @@ const OBSTACLE_COUNT = 1; // Single giant obstacle
 const OBSTACLE_SIZE_MIN = 600; // Minimum size for giant center obstacle
 const OBSTACLE_SIZE_MAX = 800; // Maximum size for giant center obstacle
 const OBSTACLE_REPULSION = 0.25;
-const OBSTACLE_ROTATION_SPEED = 0.02; // Even slower rotation (degrees per frame)
+const OBSTACLE_ROTATION_SPEED = 0.002; // Much slower rotation (degrees per frame)
 const OBSTACLE_ORBIT_RADIUS = 30; // Smaller radius for flowing/orbital movement
-const OBSTACLE_ORBIT_SPEED = 0.003; // Very slow orbital movement
+const OBSTACLE_ORBIT_SPEED = 0.001; // Very slow orbital movement (reduced from 0.003)
 const BASE_VELOCITY = 0.8;
 const MIN_EXPECTED_VELOCITY = BASE_VELOCITY * 0.3; // Minimum velocity racers should maintain (30% of base)
 const STUCK_VELOCITY_THRESHOLD = MIN_EXPECTED_VELOCITY; // Use minimum expected velocity as threshold
@@ -25,8 +25,12 @@ const STUCK_DURATION = 10; // Frames to stay stuck before intelligent escape (re
 const WIGGLE_STRENGTH = 0.3; // Strength of wiggling movement
 const ESCAPE_BURST_VELOCITY = 3.0; // High velocity burst for intelligent escape
 const ESCAPE_BURST_DURATION = 15; // Frames to maintain escape burst
-const OBSTACLE_AVOIDANCE_DISTANCE = 250; // Distance to start detecting and avoiding obstacle
-const OBSTACLE_DECELERATION_DISTANCE = 200; // Distance to start decelerating
+const OBSTACLE_AVOIDANCE_DISTANCE = 500; // Distance to start detecting and avoiding obstacle (increased significantly)
+const OBSTACLE_DECELERATION_DISTANCE = 400; // Distance to start decelerating
+const STUCK_DETECTION_FRAMES = 10; // Frames without movement to consider stuck (reduced for faster response)
+const STUCK_ESCAPE_FORCE = 2.5; // Force multiplier when stuck and escaping (increased)
+const COLLISION_ESCAPE_FORCE = 1.8; // Force multiplier when colliding (applied immediately)
+const COLLISION_ESCAPE_FRAMES = 5; // Frames of collision before applying aggressive escape
 const OBSTACLE_AVOIDANCE_STRENGTH = 0.8; // Strength of avoidance force
 const DECELERATION_FACTOR = 0.85; // How much to reduce velocity when approaching obstacle
 const ACCELERATION_FACTOR = 1.15; // How much to increase velocity after avoiding (capped at BASE_VELOCITY)
@@ -37,6 +41,13 @@ const TARGET_SMOOTHING = 0.05;
 const WALL_BOUNCE_DAMPING = 0.8;
 const GOAL_PULL_STRENGTH = 0.03;
 const DRAG = 0.997;
+const VELOCITY_SMOOTHING = 0.08; // Smooth velocity changes (lower = smoother)
+const PATH_PLANNING_LOOKAHEAD = 200; // How far ahead to plan path (pixels) - increased for earlier detection
+const PATH_PLANNING_STEPS = 10; // Number of steps to check ahead - more steps for better prediction
+const MIN_TURN_RATE = 0.02; // Minimum radians per frame for turning
+const MAX_TURN_RATE = 0.08; // Maximum radians per frame for turning
+const AVOIDANCE_LOOKAHEAD_TIME = 30; // Frames ahead to check for collisions
+const SCREEN_EDGE_PENALTY_DISTANCE = 100; // Distance from screen edge to start penalizing paths
 
 const HORSES_CONFIG = [
     { id: 1, name: "Red Shift", color: '#ff4d4f', emoji: '🔴' },
@@ -56,6 +67,164 @@ const generateDust = (width, height, count = 200) => {
         size: Math.random() * 2.5 + 0.5,
         opacity: Math.random() * 0.3 + 0.1
     }));
+};
+
+// Path planning: Find best direction to goal while avoiding obstacles
+const planPath = (x, y, goalX, goalY, currentVx, currentVy, obstacle, racerRadius, lookaheadDistance, steps, screenWidth, screenHeight) => {
+    if (!obstacle) {
+        // No obstacle, direct path to goal
+        const dx = goalX - x;
+        const dy = goalY - y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 1) return { angle: Math.atan2(currentVy, currentVx), score: 1 };
+        return { angle: Math.atan2(dy, dx), score: 1 };
+    }
+    
+    const obstacleSize = obstacle.size;
+    const verticalLength = obstacleSize * 0.6;
+    const horizontalLength = obstacleSize * 0.4;
+    const barThickness = obstacleSize * 0.08;
+    
+    // Calculate goal direction
+    const goalDx = goalX - x;
+    const goalDy = goalY - y;
+    const goalDist = Math.sqrt(goalDx * goalDx + goalDy * goalDy);
+    const goalAngle = Math.atan2(goalDy, goalDx);
+    
+    // Current velocity direction
+    const currentSpeed = Math.sqrt(currentVx * currentVx + currentVy * currentVy);
+    const currentAngle = currentSpeed > 0.01 ? Math.atan2(currentVy, currentVx) : goalAngle;
+    
+    // Calculate distance to obstacle
+    const obsDx = x - obstacle.x;
+    const obsDy = y - obstacle.y;
+    const obsDist = Math.sqrt(obsDx * obsDx + obsDy * obsDy);
+    
+    // Test angles - focus more on goal direction, less extreme angles
+    const candidateAngles = [];
+    // Reduce angle spread when far from obstacle (don't need extreme avoidance)
+    const isCloseToObstacle = obsDist < OBSTACLE_AVOIDANCE_DISTANCE;
+    const angleSpread = isCloseToObstacle ? Math.PI * 0.8 : Math.PI * 0.4; // ±40° when far, ±80° when close
+    
+    // More angles around goal direction (prioritize goal-aligned paths)
+    for (let i = -8; i <= 8; i++) {
+        candidateAngles.push(goalAngle + (i / 8) * angleSpread);
+    }
+    
+    // Fewer angles around current velocity (for smoothness, but less priority)
+    if (currentSpeed > 0.1) {
+        for (let i = -3; i <= 3; i++) {
+            const testAngle = currentAngle + (i / 3) * angleSpread * 0.3;
+            // Only add if not too close to goal angles
+            let isUnique = true;
+            for (const existing of candidateAngles) {
+                if (Math.abs(testAngle - existing) < 0.15) {
+                    isUnique = false;
+                    break;
+                }
+            }
+            if (isUnique) candidateAngles.push(testAngle);
+        }
+    }
+    
+    let bestAngle = goalAngle;
+    let bestScore = -Infinity;
+    
+    // Evaluate each candidate angle
+    for (const candidateAngle of candidateAngles) {
+        let pathSafe = true;
+        let pathClearDistance = 0;
+        let minDistanceFromObstacle = Infinity;
+        let minDistanceToGoal = goalDist;
+        let wouldHitScreenEdge = false;
+        
+        // Check path ahead in steps
+        for (let step = 1; step <= steps; step++) {
+            const testDist = (lookaheadDistance / steps) * step;
+            const testX = x + Math.cos(candidateAngle) * testDist;
+            const testY = y + Math.sin(candidateAngle) * testDist;
+            
+            // Check if path would hit screen edges (penalize these)
+            const distToLeftEdge = testX;
+            const distToRightEdge = screenWidth - testX;
+            const distToTopEdge = testY;
+            const distToBottomEdge = screenHeight - testY;
+            const minEdgeDist = Math.min(distToLeftEdge, distToRightEdge, distToTopEdge, distToBottomEdge);
+            
+            if (minEdgeDist < SCREEN_EDGE_PENALTY_DISTANCE) {
+                wouldHitScreenEdge = true;
+            }
+            
+            // Check collision with obstacle
+            const wouldCollide = checkTCollision(testX, testY, obstacle.x, obstacle.y,
+                obstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
+            
+            if (wouldCollide) {
+                pathSafe = false;
+                break;
+            }
+            
+            pathClearDistance = testDist;
+            
+            // Track minimum distances
+            const testGoalDx = goalX - testX;
+            const testGoalDy = goalY - testY;
+            const testGoalDist = Math.sqrt(testGoalDx * testGoalDx + testGoalDy * testGoalDy);
+            minDistanceToGoal = Math.min(minDistanceToGoal, testGoalDist);
+            
+            const testObsDx = testX - obstacle.x;
+            const testObsDy = testY - obstacle.y;
+            const testObsDist = Math.sqrt(testObsDx * testObsDx + testObsDy * testObsDy);
+            minDistanceFromObstacle = Math.min(minDistanceFromObstacle, testObsDist);
+        }
+        
+        if (pathSafe && pathClearDistance > 0) {
+            // Score this path - improved scoring
+            const goalAlignment = Math.cos(candidateAngle - goalAngle); // 1 if aligned, -1 if opposite
+            const currentAlignment = currentSpeed > 0.1 ? Math.cos(candidateAngle - currentAngle) : 0; // Smoothness
+            
+            // Obstacle distance score - prefer safe distance but don't require maximum distance
+            const safeObstacleDistance = obstacleSize * 0.3; // Safe distance is 30% of obstacle size
+            const obstacleDistanceScore = minDistanceFromObstacle > safeObstacleDistance ? 
+                1.0 : (minDistanceFromObstacle / safeObstacleDistance); // Full score if safe distance
+            
+            // Path length score - prefer longer clear paths
+            const pathLengthScore = pathClearDistance / lookaheadDistance;
+            
+            // Goal progress score - prefer paths that get closer to goal
+            const goalProgressScore = (goalDist - minDistanceToGoal) / goalDist;
+            
+            // Screen edge penalty - heavily penalize paths that go to screen edges
+            const edgePenalty = wouldHitScreenEdge ? -5 : 0;
+            
+            // Weighted score - goal alignment is most important, but balanced with other factors
+            const score = goalAlignment * 8 + // Goal alignment (most important, increased weight)
+                         currentAlignment * 3 + // Smoothness (avoid sharp turns)
+                         obstacleDistanceScore * 4 + // Safe distance from obstacle
+                         pathLengthScore * 3 + // Path clarity
+                         goalProgressScore * 5 + // Progress toward goal
+                         edgePenalty; // Penalty for screen edges
+            
+            if (score > bestScore) {
+                bestScore = score;
+                bestAngle = candidateAngle;
+            }
+        }
+    }
+    
+    return { angle: bestAngle, score: bestScore };
+};
+
+// Smoothly interpolate between current angle and target angle
+const smoothTurn = (currentAngle, targetAngle, maxTurnRate) => {
+    // Normalize angles to [-PI, PI]
+    let diff = targetAngle - currentAngle;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    
+    // Clamp turn rate
+    const turnAmount = Math.max(-maxTurnRate, Math.min(maxTurnRate, diff));
+    return currentAngle + turnAmount;
 };
 
 // T-shaped collision detection with circles
@@ -130,9 +299,9 @@ const App = () => {
     const obstacleOrbitAngleRef = useRef(0);
     const [racers, setRacers] = useState([]);
     const [finishedRankings, setFinishedRankings] = useState([]);
-            const [bet, setBet] = useState(null);
+    const [bet, setBet] = useState(null);
             const [difficulty, setDifficulty] = useState(4);
-            const [statusText, setStatusText] = useState("");
+    const [statusText, setStatusText] = useState("");
             const [consecutiveWins, setConsecutiveWins] = useState(0);
             const [countdown, setCountdown] = useState(null);
             const [goalReached, setGoalReached] = useState(false);
@@ -199,26 +368,17 @@ const App = () => {
             const vx = 0; // Start with zero velocity
             const vy = 0;
 
-            // Path variation: alternate between "up then right" and "right then up" strategies
-            // Half go up-first, half go right-first
-            const goRightFirst = index % 2 === 0; // Alternate racers
-            const rightBias = goRightFirst ? 0.7 : 0.3; // Stronger horizontal component for right-first
-            const upBias = goRightFirst ? 0.3 : 0.7; // Stronger vertical component for up-first
-            
-            const targetVx = BASE_VELOCITY * (0.5 + Math.random() * 0.5) * rightBias;
-            const targetVy = -BASE_VELOCITY * (0.5 + Math.random() * 0.5) * upBias;
-
             return {
                 ...config,
                 x: startX, y: startY, 
                 vx, vy,
-                targetVx, targetVy, // Varied target velocity for path diversity
                 angle: Math.atan2(vy, vx),
                 tail: [],
                 finished: false,
                 finalX: 0, finalY: 0,
                 stuck: false, // Whether racer is stuck in obstacle
                 stuckFrames: 0, // Frames spent stuck
+                collisionFrames: 0, // Frames spent colliding
                 collisionDirection: null, // Direction of collision (angle in radians)
                 escapeBurstFrames: 0, // Frames remaining in escape burst
                 prevX: startX, // Previous X position for stuck detection
@@ -239,15 +399,17 @@ const App = () => {
             setStatusText(`SAFE: Finished #${rank}. No signal sent.`);
             setConsecutiveWins(prev => prev + 1); // Increment consecutive wins
         } else {
-            setStatusText('DEFEAT: Did not make the cut. Transmitting penalty... ⚡');
+            setStatusText('DEFEAT: Transmitting penalty... ⚡');
             setConsecutiveWins(0); // Reset consecutive wins when punishment is transferred
             try {
-                if (ESP32_IP_ADDRESS !== '192.168.4.1') {
-                    fetch(API_LOSE_ENDPOINT, { method: 'POST' }).catch(e => console.warn("Signal dispatched quietly"));
-                } else {
-                    console.warn("Skipping ESP32 signal: Default IP in use.");
-                }
+                // Send the POST request to the ESP32's /lose route.
+                // This triggers the handleLose() function on the ESP32 server.
+                await fetch(API_LOSE_ENDPOINT, { 
+                    method: 'POST' 
+                });
             } catch (error) {
+                // Handle network issues (e.g., ESP32 is off or IP is wrong)
+                console.error("Failed to signal ESP32:", error);
                 setStatusText('CONNECTION FAILED to ESP32');
             }
         }
@@ -255,11 +417,11 @@ const App = () => {
 
     const gameLoop = useCallback(() => {
         try {
-            const canvas = canvasRef.current;
+        const canvas = canvasRef.current;
             if (!canvas || gameState !== 'RACING' || countdown !== null) return; // Don't run game loop during countdown
 
-            const W = canvas.width;
-            const H = canvas.height;
+        const W = canvas.width;
+        const H = canvas.height;
             const GOAL_RADIUS = Math.max(W, H) * 0.15;
 
         // Update single giant obstacle: rotation and orbital/flowing movement
@@ -271,9 +433,9 @@ const App = () => {
             const orbitX = Math.cos(obstacleOrbitAngleRef.current) * OBSTACLE_ORBIT_RADIUS;
             const orbitY = Math.sin(obstacleOrbitAngleRef.current) * OBSTACLE_ORBIT_RADIUS;
             
-            // Very slow additional flowing movement (figure-8 pattern)
-            const flowX = Math.sin(obstacleOrbitAngleRef.current * 2) * OBSTACLE_ORBIT_RADIUS * 0.3;
-            const flowY = Math.cos(obstacleOrbitAngleRef.current * 1.5) * OBSTACLE_ORBIT_RADIUS * 0.2;
+            // Very slow additional flowing movement (figure-8 pattern) - reduced flow speed
+            const flowX = Math.sin(obstacleOrbitAngleRef.current * 2) * OBSTACLE_ORBIT_RADIUS * 0.15;
+            const flowY = Math.cos(obstacleOrbitAngleRef.current * 1.5) * OBSTACLE_ORBIT_RADIUS * 0.1;
             
             currentObstacle = {
                 ...obstacle,
@@ -291,11 +453,12 @@ const App = () => {
             const newRacers = prevRacers.map(r => {
                 if (r.finished) return r;
 
-                let { x, y, vx, vy, targetVx, targetVy, angle, tail, stuck, stuckFrames, collisionDirection, escapeBurstFrames, approachingObstacle, avoidingObstacle, avoidanceDirection, baseVelocity } = r;
+                let { x, y, vx, vy, angle, tail, stuck, stuckFrames: prevStuckFrames, collisionDirection, escapeBurstFrames, approachingObstacle, avoidingObstacle, avoidanceDirection, baseVelocity } = r;
                 
                 // Track previous position to detect if stuck in place
                 const prevX = r.prevX !== undefined ? r.prevX : x;
                 const prevY = r.prevY !== undefined ? r.prevY : y;
+                const positionChange = Math.sqrt((x - prevX) * (x - prevX) + (y - prevY) * (y - prevY));
 
                 // T-shaped collision detection with physical collision
                 const racerRadius = Math.max(RACER_WIDTH, RACER_HEIGHT);
@@ -304,372 +467,184 @@ const App = () => {
                 const horizontalLength = obstacleSize * 0.4;
                 const barThickness = obstacleSize * 0.08;
                 
-                // Check if currently colliding (needed for avoidance system)
+                // ===== STEP 1: Check current collision state =====
                 let isColliding = false;
                 if (currentObstacle) {
                     isColliding = checkTCollision(x, y, currentObstacle.x, currentObstacle.y, 
                         currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
                 }
                 
-                // Enhanced obstacle avoidance - smart scanning and avoidance system
-                // Always active when near obstacle or colliding
-                if (currentObstacle && escapeBurstFrames === 0) {
+                // Track collision frames for immediate escape response
+                const collisionFrames = isColliding ? ((r.collisionFrames || 0) + 1) : 0;
+                const needsImmediateEscape = collisionFrames >= COLLISION_ESCAPE_FRAMES;
+                
+                // Detect stuck state - not moving much for several frames
+                const currentSpeed = Math.sqrt(vx * vx + vy * vy);
+                const isMovingSlowly = currentSpeed < STUCK_VELOCITY_THRESHOLD;
+                const isStuckInPlace = positionChange < STUCK_POSITION_THRESHOLD;
+                const isStuck = (isColliding || isMovingSlowly) && isStuckInPlace;
+                
+                // Update stuck frames counter
+                const stuckFrames = isStuck ? (prevStuckFrames || 0) + 1 : 0;
+                const isTrulyStuck = stuckFrames >= STUCK_DETECTION_FRAMES;
+                
+                // Determine if we need aggressive escape
+                const shouldEscapeAggressively = isTrulyStuck || needsImmediateEscape || (isColliding && isMovingSlowly);
+                
+                // ===== STEP 2: If currently colliding, immediately push away =====
+                if (isColliding && currentObstacle) {
+                    // Calculate direction away from obstacle
                     const obsDx = x - currentObstacle.x;
                     const obsDy = y - currentObstacle.y;
-                    const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
-                    const currentSpeed = Math.sqrt(vx * vx + vy * vy);
+                    const obsDist = Math.sqrt(obsDx * obsDx + obsDy * obsDy);
                     
-                    // Check if within detection range or currently colliding
-                    // Always avoid if colliding, or if close and heading towards obstacle
-                    const futureX = x + vx * 20;
-                    const futureY = y + vy * 20;
-                    const wouldHit = checkTCollision(futureX, futureY, currentObstacle.x, currentObstacle.y,
-                        currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
-                    
-                    const shouldAvoid = isColliding || (obsDist < OBSTACLE_AVOIDANCE_DISTANCE && (wouldHit || obsDist < racerRadius * 5));
-                    
-                    if (shouldAvoid) {
-                        approachingObstacle = true;
-                        avoidingObstacle = true;
+                    if (obsDist > 0.1) {
+                        const normalX = obsDx / obsDist;
+                        const normalY = obsDy / obsDist;
                         
-                        // Calculate best avoidance direction with comprehensive scanning
-                        const goalDx = W - x;
-                        const goalDy = 0 - y;
-                        const goalAngle = Math.atan2(goalDy, goalDx);
+                        // Find safe position away from obstacle
+                        let escapeX = x;
+                        let escapeY = y;
+                        let foundEscape = false;
                         
-                        // Scan multiple directions (16 directions for better coverage)
-                        const avoidanceCandidates = [];
-                        const scanDirections = 16;
+                        // Try multiple escape distances and directions
+                        const escapeDistances = isTrulyStuck ? [racerRadius * 8, racerRadius * 5, racerRadius * 3] : [racerRadius * 5, racerRadius * 3, racerRadius * 2];
                         
-                        for (let i = 0; i < scanDirections; i++) {
-                            const scanAngle = (Math.PI * 2 * i) / scanDirections;
-                            avoidanceCandidates.push({ angle: scanAngle, score: 0 });
-                        }
-                        
-                        // Score each candidate direction
-                        for (let i = 0; i < avoidanceCandidates.length; i++) {
-                            const candidate = avoidanceCandidates[i];
+                        for (const escapeDist of escapeDistances) {
+                            // Try directly away first
+                            escapeX = x + normalX * escapeDist;
+                            escapeY = y + normalY * escapeDist;
                             
-                            // Test multiple points along this direction to ensure path is safe
-                            let pathSafe = true;
-                            let maxSafeDistance = 0;
+                            if (!checkTCollision(escapeX, escapeY, currentObstacle.x, currentObstacle.y,
+                                currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius)) {
+                                foundEscape = true;
+                                break;
+                            }
                             
-                            for (let step = 1; step <= 5; step++) {
-                                const testDistance = racerRadius * 3 * step;
-                                const testX = x + Math.cos(candidate.angle) * testDistance;
-                                const testY = y + Math.sin(candidate.angle) * testDistance;
+                            // Try 8 directions around the normal
+                            for (let angleOffset = 0; angleOffset < Math.PI * 2; angleOffset += Math.PI / 4) {
+                                const escapeDirX = Math.cos(Math.atan2(normalY, normalX) + angleOffset);
+                                const escapeDirY = Math.sin(Math.atan2(normalY, normalX) + angleOffset);
+                                escapeX = x + escapeDirX * escapeDist;
+                                escapeY = y + escapeDirY * escapeDist;
                                 
-                                const isSafe = !checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
-                                    currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
-                                
-                                if (isSafe) {
-                                    maxSafeDistance = testDistance;
-                                } else {
-                                    if (step === 1) {
-                                        pathSafe = false; // Immediate collision
-                                    }
+                                if (!checkTCollision(escapeX, escapeY, currentObstacle.x, currentObstacle.y,
+                                    currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius)) {
+                                    foundEscape = true;
                                     break;
                                 }
                             }
                             
-                            if (pathSafe && maxSafeDistance > 0) {
-                                // Calculate scores
-                                const testX = x + Math.cos(candidate.angle) * maxSafeDistance;
-                                const testY = y + Math.sin(candidate.angle) * maxSafeDistance;
-                                const testObsDx = testX - currentObstacle.x;
-                                const testObsDy = testY - currentObstacle.y;
-                                const testObsDist = Math.sqrt(testObsDx*testObsDx + testObsDy*testObsDy);
-                                
-                                const distanceScore = testObsDist * 3; // Strong preference for moving away
-                                const goalAlignment = Math.cos(candidate.angle - goalAngle);
-                                const goalScore = goalAlignment * 5; // Moderate goal preference
-                                const pathLengthScore = maxSafeDistance * 0.5; // Prefer longer safe paths
-                                
-                                candidate.score = distanceScore + goalScore + pathLengthScore;
-                            } else {
-                                candidate.score = -Infinity; // Unsafe direction
-                            }
+                            if (foundEscape) break;
                         }
                         
-                        // Find best avoidance direction
-                        let bestAvoidance = null;
-                        let bestScore = -Infinity;
-                        for (const candidate of avoidanceCandidates) {
-                            if (candidate.score > bestScore) {
-                                bestScore = candidate.score;
-                                bestAvoidance = candidate.angle;
-                            }
-                        }
-                        
-                        if (bestAvoidance !== null) {
-                            avoidanceDirection = bestAvoidance;
+                        // If found escape, move there and set velocity away from obstacle
+                        if (foundEscape) {
+                            const escapeAngle = Math.atan2(escapeY - y, escapeX - x);
+                            const escapeSpeed = baseVelocity * (isTrulyStuck ? STUCK_ESCAPE_FORCE : COLLISION_ESCAPE_FORCE);
                             
-                            // Smooth deceleration when approaching obstacle
-                            if (obsDist < OBSTACLE_DECELERATION_DISTANCE || isColliding) {
-                                const targetSpeed = Math.max(MIN_APPROACH_VELOCITY, currentSpeed * DECELERATION_FACTOR * 0.9);
-                                const decelSmoothing = 0.12; // Smooth deceleration
-                                const speedRatio = targetSpeed / Math.max(currentSpeed, 0.01);
-                                vx = vx * (1 - decelSmoothing) + vx * speedRatio * decelSmoothing;
-                                vy = vy * (1 - decelSmoothing) + vy * speedRatio * decelSmoothing;
-                            }
+                            x = escapeX;
+                            y = escapeY;
+                            vx = Math.cos(escapeAngle) * escapeSpeed;
+                            vy = Math.sin(escapeAngle) * escapeSpeed;
                             
-                            // Smooth acceleration in the safe direction
-                            const baseAcceleration = isColliding ? OBSTACLE_AVOIDANCE_STRENGTH * 2.5 : OBSTACLE_AVOIDANCE_STRENGTH * 1.8;
-                            const accelerationStrength = baseAcceleration * (1 + (1 - obsDist / OBSTACLE_AVOIDANCE_DISTANCE) * 0.5); // Moderate strength when closer
-                            const targetAvoidanceVx = Math.cos(avoidanceDirection) * accelerationStrength;
-                            const targetAvoidanceVy = Math.sin(avoidanceDirection) * accelerationStrength;
-                            
-                            // Apply acceleration smoothly - much more gradual
-                            const avoidanceSmoothing = isColliding ? 0.15 : 0.08; // Much smoother transitions
-                            vx = vx * (1 - avoidanceSmoothing) + targetAvoidanceVx * avoidanceSmoothing;
-                            vy = vy * (1 - avoidanceSmoothing) + targetAvoidanceVy * avoidanceSmoothing;
-                            
-                            // Smoothly ensure minimum velocity when colliding
-                            if (isColliding && currentSpeed < BASE_VELOCITY * 0.3) {
-                                const minSpeed = BASE_VELOCITY * 0.4;
-                                const targetVx = (vx / Math.max(currentSpeed, 0.01)) * minSpeed;
-                                const targetVy = (vy / Math.max(currentSpeed, 0.01)) * minSpeed;
-                                const speedSmoothing = 0.1; // Smooth speed boost
-                                vx = vx * (1 - speedSmoothing) + targetVx * speedSmoothing;
-                                vy = vy * (1 - speedSmoothing) + targetVy * speedSmoothing;
-                            }
-                        } else if (isColliding) {
-                            // No safe direction found but we're colliding - smoothly try opposite of current velocity
-                            if (currentSpeed > 0.01) {
-                                const oppositeAngle = Math.atan2(vy, vx) + Math.PI;
-                                const escapeSpeed = BASE_VELOCITY * 0.8;
-                                const targetVx = Math.cos(oppositeAngle) * escapeSpeed;
-                                const targetVy = Math.sin(oppositeAngle) * escapeSpeed;
-                                const escapeSmoothing = 0.2; // Smooth transition to escape direction
-                                vx = vx * (1 - escapeSmoothing) + targetVx * escapeSmoothing;
-                                vy = vy * (1 - escapeSmoothing) + targetVy * escapeSmoothing;
-                            } else {
-                                // No velocity - smoothly push directly away from obstacle
-                                const pushX = obsDx / Math.max(obsDist, 0.1);
-                                const pushY = obsDy / Math.max(obsDist, 0.1);
-                                const targetVx = pushX * BASE_VELOCITY * 0.6;
-                                const targetVy = pushY * BASE_VELOCITY * 0.6;
-                                const pushSmoothing = 0.25; // Smooth push
-                                vx = vx * (1 - pushSmoothing) + targetVx * pushSmoothing;
-                                vy = vy * (1 - pushSmoothing) + targetVy * pushSmoothing;
-                            }
-                        }
-                    } else {
-                        // Not on collision course - might be recovering or far from obstacle
-                        if (approachingObstacle || avoidingObstacle) {
-                            // Re-accelerate after avoiding obstacle
-                            const currentSpeed = Math.sqrt(vx * vx + vy * vy);
-                            if (currentSpeed < baseVelocity) {
-                                const acceleration = Math.min(ACCELERATION_FACTOR, baseVelocity / currentSpeed);
-                                vx *= acceleration;
-                                vy *= acceleration;
-                            }
-                        }
-                        
-                        if (obsDist > OBSTACLE_AVOIDANCE_DISTANCE * 0.9) {
-                            approachingObstacle = false;
-                            avoidingObstacle = false;
-                            avoidanceDirection = null;
-                        }
-                    }
-                } else {
-                    // Not avoiding - reset flags
-                    approachingObstacle = false;
-                    avoidingObstacle = false;
-                    avoidanceDirection = null;
-                }
-                
-                // Calculate current speed and position change
-                // Safety check: ensure vx and vy are valid numbers
-                if (!isFinite(vx) || !isFinite(vy)) {
-                    vx = 0;
-                    vy = 0;
-                }
-                const currentSpeed = Math.sqrt(vx * vx + vy * vy);
-                const positionChange = Math.sqrt((x - prevX) * (x - prevX) + (y - prevY) * (y - prevY));
-                
-                // Safety check: ensure calculated values are valid
-                if (!isFinite(currentSpeed)) {
-                    vx = BASE_VELOCITY * 0.5;
-                    vy = BASE_VELOCITY * 0.5;
-                }
-                if (!isFinite(positionChange)) {
-                    // Position change invalid, but not critical
-                }
-                
-                const isMovingSlowly = currentSpeed < STUCK_VELOCITY_THRESHOLD;
-                const isStuckInPlace = positionChange < STUCK_POSITION_THRESHOLD;
-                
-                // Detect if trying to move forward but blocked (stuck in front of obstacle)
-                const goalDx = W - x;
-                const goalDy = 0 - y;
-                const goalAngle = Math.atan2(goalDy, goalDx);
-                const currentAngle = Math.atan2(vy, vx);
-                const angleToGoal = Math.abs(goalAngle - currentAngle);
-                const isTryingToMoveForward = angleToGoal < Math.PI / 2 || angleToGoal > 3 * Math.PI / 2;
-                
-                // Handle collision physics - detect stuck state and force perpendicular escape
-                if (isColliding && currentObstacle) {
-                    const obsDx = x - currentObstacle.x;
-                    const obsDy = y - currentObstacle.y;
-                    const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
-                    
-                    // Safety check: ensure obsDist is valid
-                    if (!isFinite(obsDist) || obsDist < 0.1) {
-                        // Invalid distance - use default escape
-                        vx = BASE_VELOCITY * 0.5;
-                        vy = BASE_VELOCITY * 0.5;
-                    } else {
-                        // Calculate normal vector (away from obstacle center)
-                        const normalX = obsDx / obsDist;
-                        const normalY = obsDy / obsDist;
-                    
-                        // Check if velocity is parallel to obstacle surface (perpendicular to normal)
-                        // This causes sliding along obstacle without escaping
-                        const velocityDotNormal = vx * normalX + vy * normalY;
-                        const velocityPerpX = vx - normalX * velocityDotNormal;
-                        const velocityPerpY = vy - normalY * velocityDotNormal;
-                        let perpSpeed = Math.sqrt(velocityPerpX*velocityPerpX + velocityPerpY*velocityPerpY);
-                        let awaySpeed = Math.abs(velocityDotNormal);
-                        
-                        // Safety check: ensure calculated speeds are valid
-                        if (!isFinite(perpSpeed)) {
-                            perpSpeed = 0;
-                        }
-                        if (!isFinite(awaySpeed)) {
-                            awaySpeed = 0;
-                        }
-                        
-                        // Detect stuck: colliding AND (very slow OR not moving away OR sliding along surface)
-                        const isTrulyStuck = isColliding && (
-                            currentSpeed < BASE_VELOCITY * 0.15 || 
-                            positionChange < 2 || 
-                            (perpSpeed > awaySpeed * 2 && awaySpeed < BASE_VELOCITY * 0.1) // Sliding along surface
-                        );
-                        
-                        if (isTrulyStuck) {
-                            // Smooth perpendicular escape - push away from obstacle gradually
-                            const escapeSpeed = BASE_VELOCITY * 1.0; // Moderate escape speed
-                            
-                            // Also try to find a better escape direction by testing nearby angles
-                            let bestEscapeAngle = Math.atan2(normalY, normalX);
-                            let bestEscapeDist = 0;
-                            
-                            // Test angles around the normal (perpendicular escape)
-                            for (let angleOffset = -Math.PI/3; angleOffset <= Math.PI/3; angleOffset += Math.PI/12) {
-                                const testAngle = Math.atan2(normalY, normalX) + angleOffset;
-                                const testX = x + Math.cos(testAngle) * racerRadius * 5;
-                                const testY = y + Math.sin(testAngle) * racerRadius * 5;
-                                
-                                const testSafe = !checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
-                                    currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
-                                
-                                if (testSafe) {
-                                    const testObsDx = testX - currentObstacle.x;
-                                    const testObsDy = testY - currentObstacle.y;
-                                    const testObsDist = Math.sqrt(testObsDx*testObsDx + testObsDy*testObsDy);
-                                    
-                                    if (testObsDist > bestEscapeDist) {
-                                        bestEscapeDist = testObsDist;
-                                        bestEscapeAngle = testAngle;
-                                    }
-                                }
-                            }
-                            
-                            // Smoothly apply the best escape direction
-                            const targetEscapeVx = Math.cos(bestEscapeAngle) * escapeSpeed;
-                            const targetEscapeVy = Math.sin(bestEscapeAngle) * escapeSpeed;
-                            const escapeSmoothing = 0.18; // Smooth escape transition
-                            vx = vx * (1 - escapeSmoothing) + targetEscapeVx * escapeSmoothing;
-                            vy = vy * (1 - escapeSmoothing) + targetEscapeVy * escapeSmoothing;
-                            
-                            // Safety check: ensure velocity is valid
-                            if (!isFinite(vx) || !isFinite(vy)) {
-                                const fallbackVx = normalX * escapeSpeed;
-                                const fallbackVy = normalY * escapeSpeed;
-                                vx = vx * 0.5 + fallbackVx * 0.5;
-                                vy = vy * 0.5 + fallbackVy * 0.5;
-                            }
-                        } else if (currentSpeed < BASE_VELOCITY * 0.3) {
-                            // Not fully stuck but slow - smoothly ensure we're moving away, not along
-                            // Calculate target velocity away from obstacle
-                            const targetAwaySpeed = Math.max(awaySpeed, BASE_VELOCITY * 0.5);
-                            const targetVx = normalX * targetAwaySpeed;
-                            const targetVy = normalY * targetAwaySpeed;
-                            
-                            // Smoothly blend with current velocity to maintain momentum
-                            const blendSmoothing = 0.15; // Smooth blending
-                            vx = vx * (1 - blendSmoothing) + targetVx * blendSmoothing;
-                            vy = vy * (1 - blendSmoothing) + targetVy * blendSmoothing;
-                            
-                            // Safety check
-                            if (!isFinite(vx) || !isFinite(vy)) {
-                                vx = normalX * BASE_VELOCITY * 0.5;
-                                vy = normalY * BASE_VELOCITY * 0.5;
-                            }
+                            // Mark that we've escaped this frame
+                            isColliding = false;
                         } else {
-                            // Has speed but might be sliding - smoothly ensure component away from obstacle
-                            if (velocityDotNormal < BASE_VELOCITY * 0.2) {
-                                // Not moving away enough - smoothly boost the away component
-                                const boostStrength = BASE_VELOCITY * 0.3;
-                                const boostSmoothing = 0.1; // Very smooth boost
-                                vx = vx * (1 - boostSmoothing) + (vx + normalX * boostStrength) * boostSmoothing;
-                                vy = vy * (1 - boostSmoothing) + (vy + normalY * boostStrength) * boostSmoothing;
-                            }
-                            
-                            // Safety check
-                            if (!isFinite(vx) || !isFinite(vy)) {
-                                vx = normalX * BASE_VELOCITY * 0.5;
-                                vy = normalY * BASE_VELOCITY * 0.5;
-                            }
+                            // If no escape found, at least set velocity away from obstacle
+                            const escapeAngle = Math.atan2(normalY, normalX);
+                            const escapeSpeed = baseVelocity * STUCK_ESCAPE_FORCE;
+                            vx = Math.cos(escapeAngle) * escapeSpeed;
+                            vy = Math.sin(escapeAngle) * escapeSpeed;
                         }
-                    }
-                    
-                    // Reset stuck state - we're handling escape
-                    stuck = false;
-                    stuckFrames = 0;
-                } else {
-                    // Not colliding - clear stuck state
-                    if (stuck) {
-                        stuck = false;
-                        stuckFrames = 0;
-                        collisionDirection = null;
-                        escapeBurstFrames = 0;
-                    }
-                    
-                    // Normal movement (only when not stuck and not in escape burst)
-                    // Only move if countdown is finished
-                    if (escapeBurstFrames === 0 && countdown === null) {
-                        vx += (targetVx - vx) * TARGET_SMOOTHING;
-                        vy += (targetVy - vy) * TARGET_SMOOTHING;
-                        
-                        // Only apply goal pull when not stuck (goal pull prevents backward movement)
-                        if (!stuck) {
-                            const dx = W - x;
-                            const dy = 0 - y;
-                            const dist = Math.sqrt(dx*dx + dy*dy);
-                            if (dist > 1) {
-                                vx += (dx / dist) * GOAL_PULL_STRENGTH; 
-                                vy += (dy / dist) * GOAL_PULL_STRENGTH;
-                            }
-                        }
-                        
-                        vx += (Math.random() - 0.5) * RANDOM_FACTOR;
-                        vy += (Math.random() - 0.5) * RANDOM_FACTOR;
-                        
-                        vx *= DRAG; vy *= DRAG;
-                    } else {
-                        // During escape burst, maintain escape direction (ignore goal pull)
-                        escapeBurstFrames--;
-                        // Gradually reduce but maintain direction
-                        const currentEscapeAngle = Math.atan2(vy, vx);
-                        const burstStrength = ESCAPE_BURST_VELOCITY * (0.6 + (escapeBurstFrames / ESCAPE_BURST_DURATION) * 0.4);
-                        vx = Math.cos(currentEscapeAngle) * burstStrength;
-                        vy = Math.sin(currentEscapeAngle) * burstStrength;
                     }
                 }
-
-                // Calculate new position - safety check first
+                
+                // ===== STEP 3: Normal path planning (if not colliding) =====
+                if (!isColliding) {
+                    const goalX = W;
+                    const goalY = 0;
+                    const currentAngle = currentSpeed > 0.01 ? Math.atan2(vy, vx) : Math.atan2(goalY - y, goalX - x);
+                    
+                    // Use path planning
+                    const pathPlan = planPath(x, y, goalX, goalY, vx, vy, currentObstacle, racerRadius, 
+                        PATH_PLANNING_LOOKAHEAD, PATH_PLANNING_STEPS, W, H);
+                    
+                    // Smoothly turn towards planned direction
+                    const targetAngle = pathPlan.angle;
+                    const turnRate = shouldEscapeAggressively ? MAX_TURN_RATE : MIN_TURN_RATE;
+                    const smoothedAngle = smoothTurn(currentAngle, targetAngle, turnRate);
+                    
+                    // Calculate desired velocity magnitude
+                    let desiredSpeed = baseVelocity;
+                    if (currentObstacle && !isColliding) {
+                        const obsDx = x - currentObstacle.x;
+                        const obsDy = y - currentObstacle.y;
+                        const obsDist = Math.sqrt(obsDx * obsDx + obsDy * obsDy);
+                        if (obsDist < OBSTACLE_AVOIDANCE_DISTANCE) {
+                            const slowFactor = 0.6 + 0.4 * (obsDist / OBSTACLE_AVOIDANCE_DISTANCE);
+                            desiredSpeed = baseVelocity * slowFactor;
+                        }
+                    }
+                    
+                    // Calculate target velocity
+                    const targetVx = Math.cos(smoothedAngle) * desiredSpeed;
+                    const targetVy = Math.sin(smoothedAngle) * desiredSpeed;
+                    
+                    // Smoothly interpolate velocity
+                    const smoothingFactor = VELOCITY_SMOOTHING;
+                    vx = vx * (1 - smoothingFactor) + targetVx * smoothingFactor;
+                    vy = vy * (1 - smoothingFactor) + targetVy * smoothingFactor;
+                    
+                    // Add small random variation for natural movement
+                    vx += (Math.random() - 0.5) * RANDOM_FACTOR;
+                    vy += (Math.random() - 0.5) * RANDOM_FACTOR;
+                }
+                
+                // ===== STEP 4: Check if velocity would cause collision and adjust =====
+                if (currentObstacle && !isColliding) {
+                    const newX = x + vx;
+                    const newY = y + vy;
+                    const willCollide = checkTCollision(newX, newY, currentObstacle.x, currentObstacle.y,
+                        currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
+                    
+                    if (willCollide) {
+                        // Find safe direction that doesn't collide
+                        const currentAngle = Math.atan2(vy, vx);
+                        let safeAngle = currentAngle;
+                        let foundSafe = false;
+                        
+                        // Try angles around current direction
+                        for (let angleOffset = -Math.PI; angleOffset <= Math.PI; angleOffset += Math.PI / 8) {
+                            const testAngle = currentAngle + angleOffset;
+                            const testVx = Math.cos(testAngle) * baseVelocity;
+                            const testVy = Math.sin(testAngle) * baseVelocity;
+                            const testX = x + testVx;
+                            const testY = y + testVy;
+                            
+                            if (!checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
+                                currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius)) {
+                                safeAngle = testAngle;
+                                foundSafe = true;
+                                break;
+                            }
+                        }
+                        
+                        if (foundSafe) {
+                            // Adjust velocity to safe direction
+                            const safeSpeed = Math.sqrt(vx * vx + vy * vy);
+                            vx = Math.cos(safeAngle) * safeSpeed;
+                            vy = Math.sin(safeAngle) * safeSpeed;
+                        } else {
+                            // If no safe direction found, move backwards
+                            vx = -vx * 0.5;
+                            vy = -vy * 0.5;
+                        }
+                    }
+                }
+                
+                // ===== STEP 5: Apply movement =====
+                // Safety checks
                 if (!isFinite(vx)) vx = 0;
                 if (!isFinite(vy)) vy = 0;
                 if (!isFinite(x)) x = 0;
@@ -678,130 +653,44 @@ const App = () => {
                 const newX = x + vx;
                 const newY = y + vy;
                 
-                // Check T-shaped collision before moving - prevent passing through
+                // Final collision check before moving
                 if (currentObstacle) {
                     const willCollide = checkTCollision(newX, newY, currentObstacle.x, currentObstacle.y,
                         currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
                     
                     if (willCollide) {
-                        // Prevent passing through - don't move into obstacle
-                        // Calculate normal from obstacle center to racer
-                        const obsDx = x - currentObstacle.x;
-                        const obsDy = y - currentObstacle.y;
-                        const obsDist = Math.sqrt(obsDx*obsDx + obsDy*obsDy);
-                        
-                        // Initialize normal vectors with safe defaults
-                        let normalX = 1;
-                        let normalY = 0;
-                        
-                        if (obsDist > 0.1 && isFinite(obsDist)) {
-                            normalX = obsDx / obsDist;
-                            normalY = obsDy / obsDist;
-                            
-                            // Safety check: ensure normal is valid
-                            if (!isFinite(normalX) || !isFinite(normalY)) {
-                                normalX = 1;
-                                normalY = 0;
-                            }
-                            
-                            const dot = vx * normalX + vy * normalY;
-                            
-                            // Smoothly remove velocity component towards obstacle
-                            if (dot > 0 && isFinite(dot)) {
-                                const removalSmoothing = 0.3; // Smooth removal
-                                const removedVx = normalX * dot;
-                                const removedVy = normalY * dot;
-                                vx = vx * (1 - removalSmoothing) + (vx - removedVx) * removalSmoothing;
-                                vy = vy * (1 - removalSmoothing) + (vy - removedVy) * removalSmoothing;
-                            }
-                            
-                            // If velocity is now too small or parallel to surface, smoothly add escape component
-                            const currentSpeed = Math.sqrt(vx * vx + vy * vy);
-                            if (isFinite(currentSpeed) && currentSpeed < BASE_VELOCITY * 0.2) {
-                                // Smoothly add escape velocity perpendicular to obstacle
-                                const escapeBoost = BASE_VELOCITY * 0.6;
-                                const escapeSmoothing = 0.2; // Smooth escape boost
-                                vx = vx * (1 - escapeSmoothing) + (vx + normalX * escapeBoost) * escapeSmoothing;
-                                vy = vy * (1 - escapeSmoothing) + (vy + normalY * escapeBoost) * escapeSmoothing;
-                            }
-                        } else {
-                            // Invalid distance - set default escape velocity
-                            vx = BASE_VELOCITY * 0.5;
-                            vy = BASE_VELOCITY * 0.5;
-                        }
-                        
-                        // Final safety check on velocity
-                        if (!isFinite(vx) || !isFinite(vy)) {
-                            vx = BASE_VELOCITY * 0.5;
-                            vy = BASE_VELOCITY * 0.5;
-                        }
-                        
-                        // Try to find a safe position along the movement vector (small steps)
-                        // But prioritize moving away from obstacle
-                        const originalVx = newX - x;
-                        const originalVy = newY - y;
-                        let foundSafePosition = false;
-                        let lastSafeX = x;
-                        let lastSafeY = y;
-                        
-                        // First, try moving directly away from obstacle
-                        if (obsDist > 0.1 && isFinite(obsDist) && isFinite(normalX) && isFinite(normalY)) {
-                            const escapeX = x + normalX * racerRadius * 2;
-                            const escapeY = y + normalY * racerRadius * 2;
-                            
-                            // Safety check on escape position
-                            if (isFinite(escapeX) && isFinite(escapeY)) {
-                                const escapeSafe = !checkTCollision(escapeX, escapeY, currentObstacle.x, currentObstacle.y,
-                                    currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
-                                
-                                if (escapeSafe) {
-                                    x = escapeX;
-                                    y = escapeY;
-                                    foundSafePosition = true;
-                                }
-                            }
-                        }
-                        
-                        // If direct escape didn't work, try along movement vector
-                        if (!foundSafePosition && isFinite(originalVx) && isFinite(originalVy)) {
-                            for (let step = 0.05; step <= 1.0; step += 0.05) {
-                                const testX = x + originalVx * step;
-                                const testY = y + originalVy * step;
-                                
-                                // Safety check on test position
-                                if (!isFinite(testX) || !isFinite(testY)) {
-                                    break;
-                                }
-                                
-                                const testSafe = !checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
-                                    currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius);
-                                
-                                if (testSafe) {
-                                    lastSafeX = testX;
-                                    lastSafeY = testY;
-                                    foundSafePosition = true;
+                        // Find safe position by moving backwards
+                        let safeX = x;
+                        let safeY = y;
+                        for (let step = 0.1; step <= 1.0; step += 0.1) {
+                            const testX = x - vx * step;
+                            const testY = y - vy * step;
+                            if (!checkTCollision(testX, testY, currentObstacle.x, currentObstacle.y,
+                                currentObstacle.rotation, verticalLength, horizontalLength, barThickness, racerRadius)) {
+                                safeX = testX;
+                                safeY = testY;
+                                // Update velocity to match actual movement
+                                const actualDx = safeX - x;
+                                const actualDy = safeY - y;
+                                const actualDist = Math.sqrt(actualDx * actualDx + actualDy * actualDy);
+                                if (actualDist > 0) {
+                                    const actualSpeed = Math.sqrt(vx * vx + vy * vy);
+                                    vx = (actualDx / actualDist) * actualSpeed * 0.5;
+                                    vy = (actualDy / actualDist) * actualSpeed * 0.5;
                                 } else {
-                                    // Hit obstacle - use last safe position
-                                    break;
+                                    vx = 0;
+                                    vy = 0;
                                 }
-                            }
-                            
-                            if (foundSafePosition && isFinite(lastSafeX) && isFinite(lastSafeY)) {
-                                // Move to the furthest safe position
-                                x = lastSafeX;
-                                y = lastSafeY;
-                            } else {
-                                // Can't move forward at all - stay at current position
-                                // Escape velocity has been set above
+                                break;
                             }
                         }
+                        x = safeX;
+                        y = safeY;
                     } else {
-                        // Safe to move to new position
                         x = newX;
                         y = newY;
                     }
                 } else {
-                    // No obstacle, safe to move
                     x = newX;
                     y = newY;
                 }
@@ -834,7 +723,7 @@ const App = () => {
                     return { ...r, x, y, vx: 0, vy: 0, finished: true, finalX: x, finalY: y };
                 }
 
-                return { ...r, x, y, vx, vy, targetVx, targetVy, angle, tail, stuck, stuckFrames, collisionDirection, escapeBurstFrames, prevX: x, prevY: y, approachingObstacle, avoidingObstacle, avoidanceDirection, baseVelocity };
+                return { ...r, x, y, vx, vy, angle, tail, stuck: isTrulyStuck, stuckFrames, collisionFrames, collisionDirection, escapeBurstFrames, prevX: x, prevY: y, approachingObstacle, avoidingObstacle, avoidanceDirection, baseVelocity };
             }).filter(r => {
                 // Filter out any racers with invalid positions
                 return r && isFinite(r.x) && isFinite(r.y) && isFinite(r.vx) && isFinite(r.vy);
@@ -858,9 +747,9 @@ const App = () => {
             return newRacers;
         });
 
-            if (gameState === 'RACING') {
-                animationFrameRef.current = requestAnimationFrame(gameLoop);
-            }
+        if (gameState === 'RACING') {
+            animationFrameRef.current = requestAnimationFrame(gameLoop);
+        }
         } catch (error) {
             console.error('Error in gameLoop:', error);
             // Reset racers to safe state if error occurs
@@ -1035,8 +924,8 @@ const App = () => {
             // Give racers initial velocity based on their target velocities (maintains path variation)
             setRacers(prevRacers => prevRacers.map(r => ({
                 ...r,
-                vx: r.targetVx || ((Math.random() * BASE_VELOCITY) + BASE_VELOCITY/2),
-                vy: r.targetVy || (-(Math.random() * BASE_VELOCITY) - BASE_VELOCITY/2)
+                vx: (Math.random() * BASE_VELOCITY) + BASE_VELOCITY/2,
+                vy: (-(Math.random() * BASE_VELOCITY) - BASE_VELOCITY/2)
             })));
         }
     }, [countdown, gameState]);
@@ -1065,7 +954,8 @@ const App = () => {
         if (velocityChangeTimersRef.current.length === 0) {
             racers.forEach((racer) => {
                 const scheduleNextChange = (racerId) => {
-                    const delay = Math.random() * 1300 + 200; 
+                    // Random interval between 0.2 and 0.6 seconds (200-600ms)
+                    const delay = Math.random() * 400 + 200; 
                     
                     const timer = setTimeout(() => {
                         setRacers(prevRacers => {
@@ -1074,15 +964,13 @@ const App = () => {
                                 return prevRacers;
                             }
                             
-                            const topRightBias = 0.3;
-                            const randomVx = (Math.random() * BASE_VELOCITY * 2) - BASE_VELOCITY;
-                            const randomVy = (Math.random() * BASE_VELOCITY * 2) - BASE_VELOCITY;
-                            
-                            const newTargetVx = randomVx + (BASE_VELOCITY * topRightBias);
-                            const newTargetVy = randomVy - (BASE_VELOCITY * topRightBias);
+                            // Vary base velocity slightly for more natural movement variation
+                            // Path planning will use this to adjust speed
+                            const velocityVariation = 0.7 + Math.random() * 0.6; // 70% to 130% of base
+                            const newBaseVelocity = BASE_VELOCITY * velocityVariation;
                             
                             return prevRacers.map(r => 
-                                r.id === racerId ? { ...r, targetVx: newTargetVx, targetVy: newTargetVy } : r
+                                r.id === racerId ? { ...r, baseVelocity: newBaseVelocity } : r
                             );
                         });
                         
@@ -1117,7 +1005,7 @@ const App = () => {
     useEffect(() => {
         let frameId;
         const renderLoop = () => {
-            draw();
+        draw();
             if (gameState === 'RACING' || gameState === 'FINISHED') {
                 frameId = requestAnimationFrame(renderLoop);
             }
@@ -1132,22 +1020,22 @@ const App = () => {
         
         return (
             <div 
-                style={{
+            style={{
                     position: 'absolute',
                     left: `${racer.x}px`,
                     top: `${racer.y}px`,
                     transform: 'translate(-50%, -50%)',
                     width: '24px',
                     height: '24px',
-                    border: `2px solid ${racer.color}`,
-                    borderRadius: '4px',
+                border: `2px solid ${racer.color}`,
+                borderRadius: '4px',
                     opacity: (gameState === 'RACING' && !racer.finished) ? 0.8 : 0,
                     boxShadow: `0 0 8px ${racer.color}80`,
                     pointerEvents: 'none',
                     transition: 'opacity 0.3s'
-                }}
-            />
-        );
+            }}
+        />
+    );
     };
 
     return (
@@ -1159,8 +1047,8 @@ const App = () => {
             {gameState === 'RACING' && (
                 <>
                     <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 5000, pointerEvents: 'none' }}>
-                        {racers.map(r => <RacerOutline key={r.id} racer={r} />)}
-                    </div>
+                {racers.map(r => <RacerOutline key={r.id} racer={r} />)}
+            </div>
                     {/* Countdown display */}
                     {countdown !== null && countdown > 0 && (
                         <div style={{ 
@@ -1216,8 +1104,8 @@ const App = () => {
                 {gameState === 'SETUP' && (
                     <div style={{ pointerEvents: 'auto', backgroundColor: 'rgba(17, 24, 39, 0.98)', backdropFilter: 'blur(16px)', borderRadius: '28px', border: '1px solid rgba(255, 255, 255, 0.12)', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05)', padding: '40px', maxWidth: '650px', width: '100%' }}>
                         <div style={{ textAlign: 'center', marginBottom: '8px' }}>
-                            <h1 style={{ fontSize: '42px', fontWeight: '900', background: 'linear-gradient(135deg, #ffffff 0%, #a0aec0 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', marginBottom: '8px', letterSpacing: '-0.03em' }}>MICRO DERBY</h1>
-                            <p style={{ fontSize: '13px', color: '#9ca3af', letterSpacing: '0.05em', textTransform: 'uppercase' }}>Experimental Racing Simulation</p>
+                            <h1 style={{ fontSize: '42px', fontWeight: '900', background: 'linear-gradient(135deg, #ffffff 0%, #a0aec0 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', marginBottom: '8px', letterSpacing: '-0.03em' }}>TASER DERBY</h1>
+                            <p style={{ fontSize: '13px', color: '#9ca3af', letterSpacing: '0.05em', textTransform: 'uppercase' }}>Digital stakes, physical consequence.</p>
                         </div>
 
                         {/* Win streak display in setup */}
@@ -1237,7 +1125,7 @@ const App = () => {
                                 <div style={{ textAlign: 'center' }}>
                                     <div style={{ fontSize: '11px', color: '#6ee7b7', textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: 'bold', marginBottom: '4px' }}>Current Win Streak</div>
                                     <div style={{ fontSize: '32px', color: '#10b981', fontWeight: '900', lineHeight: '1' }}>{consecutiveWins}</div>
-                                </div>
+                            </div>
                             </div>
                         )}
                         
@@ -1252,7 +1140,7 @@ const App = () => {
                                 max="8" 
                                 step="1" 
                                 value={difficulty} 
-                                onChange={(e) => setDifficulty(Number(e.target.value))} 
+                                onChange={(e) => setDifficulty(Number(e.target.value))}
                                 style={{ 
                                     width: '100%', 
                                     height: '10px', 
@@ -1276,7 +1164,7 @@ const App = () => {
                         <div style={{ marginBottom: '24px' }}>
                             <div style={{ fontSize: '12px', color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '16px', textAlign: 'center', fontWeight: '600' }}>Select Your Racer</div>
                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
-                                {HORSES_CONFIG.map(h => (
+                            {HORSES_CONFIG.map(h => (
                                     <button 
                                         key={h.id} 
                                         onClick={() => { setBet(h.id); setRacers(initializeRace(window.innerWidth, window.innerHeight)); gameStateRef.current = 'RACING'; setGameState('RACING'); }} 
@@ -1319,8 +1207,8 @@ const App = () => {
                                                 animation: 'pulse 2s ease-in-out infinite'
                                             }} />
                                         )}
-                                    </button>
-                                ))}
+                                </button>
+                            ))}
                             </div>
                         </div>
                     </div>
@@ -1330,7 +1218,7 @@ const App = () => {
                     <div style={{ pointerEvents: 'auto', backgroundColor: 'rgba(17, 24, 39, 0.98)', backdropFilter: 'blur(16px)', borderRadius: '28px', border: '1px solid rgba(255, 255, 255, 0.12)', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05)', padding: '40px', maxWidth: '550px', width: '100%', textAlign: 'center' }}>
                         <div style={{ marginBottom: '32px' }}>
                             <h2 style={{ fontSize: '32px', fontWeight: '900', color: statusText.includes('DEFEAT') ? '#ffffff' : '#10b981', textShadow: statusText.includes('DEFEAT') ? '0 0 20px rgba(220, 38, 38, 0.8), 0 2px 4px rgba(0, 0, 0, 0.5)' : '0 0 20px rgba(16, 185, 129, 0.5), 0 2px 4px rgba(0, 0, 0, 0.5)', marginBottom: '12px', letterSpacing: '-0.02em' }}>
-                                {statusText.includes('DEFEAT') ? 'EXPERIMENT FAILED' : 'EXPERIMENT SUCCESS'}
+                                {statusText.includes('DEFEAT') ? 'INSEMINATION FAILED' : 'INSEMINATION SUCCESS'}
                             </h2>
                             <div style={{ fontSize: '16px', fontWeight: 'bold', color: statusText.includes('DEFEAT') ? '#ffffff' : '#10b981', padding: '12px 20px', backgroundColor: statusText.includes('DEFEAT') ? 'rgba(220, 38, 38, 0.9)' : 'rgba(16, 185, 129, 0.1)', borderRadius: '12px', border: `1px solid ${statusText.includes('DEFEAT') ? 'rgba(220, 38, 38, 1)' : 'rgba(16, 185, 129, 0.3)'}`, display: 'inline-block' }}>
                                 {statusText}
@@ -1434,4 +1322,4 @@ const App = () => {
     );
 };
 
-export default App; 
+export default App;
