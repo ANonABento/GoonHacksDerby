@@ -1,8 +1,8 @@
-# 🥚GoonHacks: TaserDerby
+# 🥚TaserDerby Website
 
 ## Overview
 
-The TaserDerby is a high-stakes, single-player race betting application designed to interface directly with an ESP32-C3 microcontroller connected to a relay module. 
+TaserDerby is a high-stakes, single-player race betting application designed to interface directly with an ESP32-C3 microcontroller connected to a relay module. 
 
 The application runs a simulated microscopic race. If the user's chosen racer **fails to finish within the Top X** (where X is the selected Difficulty), a specific API endpoint (`/lose`) is called on the ESP32. This triggers the relay, administering a momentary "penalty" pulse to a connected load (like a light or a low-voltage device).
 
